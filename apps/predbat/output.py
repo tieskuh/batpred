@@ -1377,10 +1377,19 @@ class Output:
             # Car charging?
             if self.num_cars > 0:
                 car_charging_kwh = self.car_charge_slot_kwh(minute_start, minute_end)
-                car_total += car_charging_kwh
+                # Opportunistic solar diversion modelled in the forecast (cumulative kWh, like iBoost)
+                car_solar_amount = self.predict_car_solar_best.get(minute_relative_start, 0)
+                car_solar_amount_end = self.predict_car_solar_best.get(minute_relative_slot_end, car_solar_amount)
+                car_solar_change = max(car_solar_amount_end - car_solar_amount, 0.0)
+                car_total += car_charging_kwh + car_solar_change
                 if car_charging_kwh > 0.0:
-                    car_charging_str = str(car_charging_kwh)
-                    car_color = "FFFF00"
+                    # Planned (grid) charging - shown yellow, includes any solar diverted in the same slot
+                    car_charging_str = str(dp2(car_charging_kwh + car_solar_change))
+                    car_color = "#FFFF00"
+                elif car_solar_change > 0.0:
+                    # Pure opportunistic solar diversion - shown green
+                    car_charging_str = str(dp2(car_solar_change))
+                    car_color = "#AEF8A0"
                 else:
                     car_charging_str = "&#9866;"
                     car_color = "#FFFFFF"

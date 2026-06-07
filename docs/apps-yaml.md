@@ -1582,6 +1582,10 @@ whether you are within an Octopus Energy "smart charge" slot
 - **car_charging_battery_size** - Car battery size in kWh
 - **car_charging_limit** - Percentage limit the car is set to charge to
 - **car_charging_soc** - Car's current charge level expressed as a percentage
+- **car_charging_solar** - Per-car flag to model opportunistic (sun-following) charging done by an external charger such as EVCC; modelling only, no grid charging is planned. See [Opportunistic solar charging](car-charging.md#opportunistic-solar-sun-following-charging)
+- **car_charging_plugged** - Optional per-car sensor indicating the car is plugged in over the forecast horizon (falls back to car_charging_now)
+- **car_charging_solar_max_power** - Maximum solar diversion power in kW (defaults to the configured car charging rate, uncapped for 3-phase chargers)
+- **car_charging_solar_min_power** - Minimum power in kW before the charger will start diverting solar (e.g. single-phase 6A)
 - **ohme_login** - Ohme EV charger account login
 - **ohme_password** - Password for above Ohme account
 - **ohme_automatic_octopus_intelligent** - Controls whether Predbat talks directly to the above Ohme account

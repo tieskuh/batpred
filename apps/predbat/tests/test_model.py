@@ -1870,6 +1870,99 @@ def run_model_tests(my_predbat):
         assert_iboost_running_solar=True,
     )
 
+    # Opportunistic solar (sun-following) car charging diversion model
+    reset_rates(my_predbat, import_rate, export_rate)
+    reset_inverter(my_predbat)
+    # Baseline: no solar car -> all PV charges the home battery (battery rate caps at 1kW => 24kWh/day)
+    failed |= simple_scenario("car_solar_off", my_predbat, 0, 1.0, assert_final_metric=0, assert_final_soc=24, with_battery=True, battery_size=100, battery_soc=0, battery_rate_max_charge=1.0)
+    # Solar car plugged in, capped at 1kW -> all PV diverted off the top to the car, home battery stays empty
+    failed |= simple_scenario(
+        "car_solar_divert",
+        my_predbat,
+        0,
+        1.0,
+        assert_final_metric=0,
+        assert_final_soc=0,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=1.0,
+        car_solar_limit=100,
+        assert_final_car_solar=24,
+    )
+    # No PV at night -> nothing diverted, behaves like the baseline-empty case
+    failed |= simple_scenario(
+        "car_solar_night",
+        my_predbat,
+        0,
+        0,
+        assert_final_metric=0,
+        assert_final_soc=0,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=1.0,
+        car_solar_limit=100,
+        assert_final_car_solar=0,
+    )
+    # Home battery priority threshold (min_soc 50%) not reached (battery only gets to 24%) -> no diversion
+    failed |= simple_scenario(
+        "car_solar_min_soc_block",
+        my_predbat,
+        0,
+        1.0,
+        assert_final_metric=0,
+        assert_final_soc=24,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=1.0,
+        car_solar_min_soc=50,
+        car_solar_limit=100,
+        assert_final_car_solar=0,
+    )
+    # Charger minimum start power (2kW) not reached by 1kW of surplus -> no diversion
+    failed |= simple_scenario(
+        "car_solar_min_power_block",
+        my_predbat,
+        0,
+        1.0,
+        assert_final_metric=0,
+        assert_final_soc=24,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=7.4,
+        car_solar_min_power=2.0,
+        car_solar_limit=100,
+        assert_final_car_solar=0,
+    )
+    # Limited by remaining car capacity to the limit (10 kWh) -> 10 kWh to car, the rest to the home battery
+    failed |= simple_scenario(
+        "car_solar_capacity_cap",
+        my_predbat,
+        0,
+        1.0,
+        assert_final_metric=0,
+        assert_final_soc=14,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=1.0,
+        car_solar_limit=10,
+        assert_final_car_solar=10,
+    )
+
     # PV AC limit tests (AC-coupled / non-hybrid inverters only)
     reset_rates(my_predbat, import_rate, export_rate)
     reset_inverter(my_predbat)
