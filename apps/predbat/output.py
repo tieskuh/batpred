@@ -1569,8 +1569,8 @@ class Output:
                 json_row["extra_color"] = extra_color
             if self.num_cars > 0:
                 # Include the modelled opportunistic solar diversion so the JSON/web plan view matches the HTML cell
-                json_row["car_charging"] = car_charging_kwh + car_solar_change
-                json_row["car_solar"] = car_solar_change
+                json_row["car_charging"] = dp2(car_charging_kwh + car_solar_change)
+                json_row["car_solar"] = dp2(car_solar_change)
                 json_row["car_color"] = car_color
             if self.iboost_enable:
                 json_row["iboost"] = iboost_amount
