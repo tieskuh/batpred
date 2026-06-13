@@ -1881,6 +1881,7 @@ class Fetch:
         self.car_charging_plugged = [False for c in range(self.num_cars)]
         self.car_charging_solar_max_power = [self.car_charging_rate[c] for c in range(self.num_cars)]
         self.car_charging_solar_min_power = [0.0 for c in range(self.num_cars)]
+        self.car_charging_solar_power_step = [0.0 for c in range(self.num_cars)]
 
         self.car_charging_planned_response = self.get_arg("car_charging_planned_response", ["yes", "on", "enable", "true"])
         self.car_charging_now_response = self.get_arg("car_charging_now_response", ["yes", "on", "enable", "true"])
@@ -1927,8 +1928,12 @@ class Fetch:
             # Maximum diversion power - defaults to the configured car charging rate, but is uncapped (3-phase chargers exceed the rate slider limit)
             self.car_charging_solar_max_power[car_n] = float(self.get_arg("car_charging_solar_max_power", self.car_charging_rate[car_n], index=car_n))
 
-            # Minimum power needed before the charger will start diverting (1-phase 6A etc.)
+            # Minimum power needed before the charger will start diverting (e.g. 3-phase 6A)
             self.car_charging_solar_min_power[car_n] = float(self.get_arg("car_charging_solar_min_power", 0.0, index=car_n))
+
+            # Discrete charge power step (kW). Real chargers only switch in whole current steps (e.g. 1A = ~0.69kW on 3-phase),
+            # so they leave a small surplus remainder. 0 = continuous (no quantisation).
+            self.car_charging_solar_power_step[car_n] = float(self.get_arg("car_charging_solar_power_step", 0.0, index=car_n))
 
             # Plugged-in status over the forecast horizon - falls back to "charging now" if no dedicated sensor is configured
             plugged = self.get_arg("car_charging_plugged", None, index=car_n)

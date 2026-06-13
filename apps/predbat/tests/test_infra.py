@@ -563,6 +563,7 @@ def simple_scenario(
     car_charging_solar=False,
     car_solar_max_power=7.4,
     car_solar_min_power=0.0,
+    car_solar_power_step=0.0,
     car_solar_min_soc=0.0,
     car_solar_limit=100.0,
     assert_final_car_solar=None,
@@ -707,6 +708,7 @@ def simple_scenario(
     my_predbat.car_charging_plugged[0] = car_charging_solar
     my_predbat.car_charging_solar_max_power[0] = car_solar_max_power
     my_predbat.car_charging_solar_min_power[0] = car_solar_min_power
+    my_predbat.car_charging_solar_power_step[0] = car_solar_power_step
     my_predbat.car_charging_solar_min_soc = car_solar_min_soc
     if car_charging_solar:
         my_predbat.car_charging_limit[0] = car_solar_limit

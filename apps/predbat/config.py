@@ -2126,6 +2126,7 @@ APPS_SCHEMA = {
     "car_charging_plugged": {"type": "sensor|sensor_list", "sensor_type": "string", "entries": "num_cars"},
     "car_charging_solar_max_power": {"type": "sensor|sensor_list", "sensor_type": "float", "entries": "num_cars"},
     "car_charging_solar_min_power": {"type": "sensor|sensor_list", "sensor_type": "float", "entries": "num_cars"},
+    "car_charging_solar_power_step": {"type": "sensor|sensor_list", "sensor_type": "float", "entries": "num_cars"},
     "carbon_intensity": {"type": "sensor", "sensor_type": "string"},
     "carbon_postcode": {"type": "string", "empty": False},
     "carbon_automatic": {"type": "boolean"},

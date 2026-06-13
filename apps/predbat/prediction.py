@@ -138,6 +138,7 @@ class Prediction:
             self.car_charging_plugged = base.car_charging_plugged
             self.car_charging_solar_max_power = base.car_charging_solar_max_power
             self.car_charging_solar_min_power = base.car_charging_solar_min_power
+            self.car_charging_solar_power_step = base.car_charging_solar_power_step
             self.car_charging_solar_min_soc = base.car_charging_solar_min_soc
             self.iboost_enable = base.iboost_enable
             self.iboost_on_export = base.iboost_on_export
@@ -710,19 +711,31 @@ class Prediction:
                             car_load_energy_bypass += car_load_scale / self.car_charging_loss
 
                 # Opportunistic solar (sun-following) diversion model.
-                # Generalises the iBoost solar diverter to the car loadpoint: PV is taken "off the top"
-                # (before the home battery / export see it) once the home battery is above the configured
-                # priority SoC, mirroring an external solar charger such as EVCC. Modelling only - Predbat
-                # does not control the car here, it only reflects the diverted energy in the forecast.
+                # Generalises the iBoost solar diverter to the car loadpoint, mirroring an external solar
+                # charger such as EVCC. The car only takes the PV that is left after the house load is served
+                # (true surplus), and only once the home battery is above the configured priority SoC.
+                # Modelling only - Predbat does not control the car, it only reflects the diverted energy.
                 for car_n in range(self.num_cars):
                     if self.car_charging_solar[car_n] and self.car_charging_plugged[car_n] and pv_now > 0 and car_soc[car_n] < self.car_charging_limit[car_n]:
                         # Home battery priority: only divert to the car once the home battery SoC is above the threshold
                         if soc_max <= 0 or (soc * 100.0 / soc_max) >= self.car_charging_solar_min_soc:
-                            max_power_step = self.car_charging_solar_max_power[car_n] * step / 60.0
-                            min_power_step = self.car_charging_solar_min_power[car_n] * step / 60.0
-                            car_solar_amount = min(pv_now, max_power_step)
-                            # Charger minimum start power: below this the car will not draw any solar
-                            if car_solar_amount >= min_power_step:
+                            # Only the PV left after the house load is served is available to the car
+                            surplus = max(pv_now - load_yesterday, 0)
+                            # Available charge power (kW), capped at the maximum diversion power
+                            avail_power = min(surplus * 60.0 / step, self.car_charging_solar_max_power[car_n])
+                            min_power = self.car_charging_solar_min_power[car_n]
+                            power_step = self.car_charging_solar_power_step[car_n]
+                            if avail_power < min_power:
+                                # Below the charger's minimum start power - nothing is diverted
+                                charge_power = 0
+                            elif power_step > 0:
+                                # Real chargers only switch in whole current steps (e.g. 1A), so they charge at the
+                                # largest discrete level at or below the surplus, leaving a small remainder to the battery/export
+                                charge_power = min_power + int((avail_power - min_power) / power_step) * power_step
+                            else:
+                                charge_power = avail_power
+                            car_solar_amount = charge_power * step / 60.0
+                            if car_solar_amount > 0:
                                 # Cap by remaining capacity to the limit (battery-side kWh converted to PV-side draw via the charging loss)
                                 room = max(self.car_charging_limit[car_n] - car_soc[car_n], 0)
                                 if self.car_charging_loss > 0:

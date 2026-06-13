@@ -1962,6 +1962,44 @@ def run_model_tests(my_predbat):
         car_solar_limit=10,
         assert_final_car_solar=10,
     )
+    # Only the surplus after the house load is diverted: 2kW PV - 1kW load = 1kW to the car (not the full 2kW)
+    failed |= simple_scenario(
+        "car_solar_load_subtracted",
+        my_predbat,
+        1.0,
+        2.0,
+        assert_final_metric=0,
+        assert_final_soc=0,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=2.0,
+        car_solar_limit=100,
+        assert_final_car_solar=24,
+    )
+    # Discrete charge steps (2kW): 9kW surplus -> charges at 8kW (4 + 2*2), leaving 1kW to the home battery.
+    # The 1kW remainder filling the battery to 24kWh is the robust proof of quantisation (continuous would give 0).
+    # car_solar reports the start-of-slot cumulative (one PREDICT_STEP behind the final car SoC, like predict_iboost_best).
+    failed |= simple_scenario(
+        "car_solar_power_step",
+        my_predbat,
+        0,
+        9.0,
+        assert_final_metric=0,
+        assert_final_soc=24,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=1.0,
+        car_charging_solar=True,
+        car_solar_max_power=11.0,
+        car_solar_min_power=4.0,
+        car_solar_power_step=2.0,
+        car_solar_limit=1000,
+        assert_final_car_solar=191.33,
+    )
 
     # PV AC limit tests (AC-coupled / non-hybrid inverters only)
     reset_rates(my_predbat, import_rate, export_rate)

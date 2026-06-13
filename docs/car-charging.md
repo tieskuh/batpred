@@ -405,8 +405,8 @@ It generalises the iBoost solar diversion logic to the car loadpoint, without th
 When enabled for a car:
 
 - Predbat plans **no** grid/low-rate slots for that car (unless a departure plan is active - see below).
-- In the forecast, the car takes PV surplus "off the top" before the home battery and export see it, so the home battery SoC and export are lower on sunny days,
-  and the modelled car SoC rises towards its limit.
+- In the forecast, the car takes the PV surplus that is left **after the house load is served** (it does not steal PV from the house), so the home battery SoC and
+  export are lower on sunny days, and the modelled car SoC rises towards its limit.
 - The diversion is bounded by the available PV surplus, the configured power band, the remaining car capacity up to `car_charging_limit`, and a home battery SoC threshold.
 
 Configuration (all per-car, set in `apps.yaml` unless noted):
@@ -415,7 +415,10 @@ Configuration (all per-car, set in `apps.yaml` unless noted):
 - **car_charging_plugged** - optional sensor per car indicating the car is plugged in across the forecast horizon. If not supplied it falls back to **car_charging_now**.
   This is needed because "charging now" says nothing about future daylight slots.
 - **car_charging_solar_max_power** - maximum diversion power in kW. Defaults to the configured **car_charging_rate** and is uncapped (3-phase chargers can exceed the rate slider limit).
-- **car_charging_solar_min_power** - minimum power in kW before the charger will start diverting (e.g. single-phase 6A is about 1.4kW). Below this, no solar is diverted.
+- **car_charging_solar_min_power** - minimum power in kW before the charger will start diverting (e.g. 3-phase 6A is about 4.1kW). Below this surplus, no solar is diverted.
+- **car_charging_solar_power_step** - optional discrete charge-power step in kW (default 0 = continuous). Real chargers only switch in whole current steps
+  (1A on a 3-phase charger is about 0.69kW), so they charge at the largest discrete level at or below the surplus and leave a small remainder to the home battery/export.
+  Set this to model that quantisation; leave at 0 to let the car follow the surplus exactly.
 - **input_number.predbat_car_charging_solar_min_soc** - home battery SoC threshold (%) in Home Assistant. The car only takes solar once the home battery is above this level,
   mirroring EVCC's `priority_soc` so the home battery is charged first. Default 0%.
 
