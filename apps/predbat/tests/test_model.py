@@ -2000,6 +2000,42 @@ def run_model_tests(my_predbat):
         car_solar_limit=1000,
         assert_final_car_solar=191.33,
     )
+    # Solar limit decoupled from the grid plan target: solar caps at car_solar_limit (60), NOT car_charging_limit (80)
+    failed |= simple_scenario(
+        "car_solar_limit_split",
+        my_predbat,
+        0,
+        3.0,
+        assert_final_metric=0,
+        assert_final_soc=12,
+        with_battery=True,
+        battery_size=100,
+        battery_soc=0,
+        battery_rate_max_charge=3.0,
+        inverter_limit=10.0,
+        car_charging_solar=True,
+        car_solar_max_power=3.0,
+        car_limit=80,
+        car_solar_limit=60,
+        assert_final_car_solar=60,
+    )
+    # Solar-first ordering: with a planned grid slot AND solar, the surplus is taken before the grid load is added,
+    # so solar gets the full 0.6kW surplus (=> 14.4 kWh). Grid-first would subtract the 0.3kW car load first (=> 7.2).
+    failed |= simple_scenario(
+        "car_solar_first_order",
+        my_predbat,
+        0,
+        0.6,
+        assert_final_metric=import_rate * 7.2,
+        assert_final_soc=0,
+        with_battery=False,
+        charge_car=0.3,
+        car_charging_solar=True,
+        car_solar_max_power=0.7,
+        car_limit=1000,
+        car_solar_limit=1000,
+        assert_final_car_solar=14.4,
+    )
 
     # PV AC limit tests (AC-coupled / non-hybrid inverters only)
     reset_rates(my_predbat, import_rate, export_rate)

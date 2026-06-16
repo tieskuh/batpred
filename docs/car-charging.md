@@ -419,14 +419,18 @@ Configuration (all per-car, set in `apps.yaml` unless noted):
 - **car_charging_solar_power_step** - optional discrete charge-power step in kW (default 0 = continuous). Real chargers only switch in whole current steps
   (1A on a 3-phase charger is about 0.69kW), so they charge at the largest discrete level at or below the surplus and leave a small remainder to the home battery/export.
   Set this to model that quantisation; leave at 0 to let the car follow the surplus exactly.
+- **car_charging_solar_limit** - the SoC (%) the opportunistic solar charging fills the car to, **independent of the grid plan target** (`car_charging_limit`).
+  Defaults to `car_charging_limit` when not set. With EVCC this is the loadpoint's limit SoC (its PV cap), while `car_charging_limit` is the departure plan target.
 - **input_number.predbat_car_charging_solar_min_soc** - home battery SoC threshold (%) in Home Assistant. The car only takes solar once the home battery is above this level,
   mirroring EVCC's `priority_soc` so the home battery is charged first. Default 0%.
 
 On the [Predbat plan](predbat-plan-card.md), solar diverted to the car is shown in the car column in **green** (as opposed to yellow for planned grid charging).
 
 **Pairing with a departure plan:** if you also set a departure plan for the car (i.e. `car_charging_planned` is active), Predbat's normal planner still runs to guarantee the
-departure target, *and* the solar diversion is modelled on top. Because the forecast fills the car from daytime solar first and caps each car at its limit, the night-time
-grid top-up is automatically reduced to only what the sun did not provide. This matches how EVCC keeps a plan while still soaking up any remaining solar.
+departure target, *and* the solar diversion is modelled on top. The two SoC targets are independent: solar fills the car up to `car_charging_solar_limit` (the PV cap), while
+the grid plan tops the car up to `car_charging_limit` (the departure target). So you can, for example, let solar charge to 60% opportunistically while a plan still guarantees
+80% by departure, or let solar charge to 80% while the plan only guarantees 60% from grid - both are modelled correctly. Solar is always applied **before** the planned grid
+charging in each step, so free solar is used first and the grid only covers the remainder, matching how EVCC keeps a plan while still soaking up any remaining solar.
 
 ## Additional Car charging configurations
 

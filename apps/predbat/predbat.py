@@ -591,6 +591,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.car_charging_solar_max_power = [7.4]
         self.car_charging_solar_min_power = [0.0]
         self.car_charging_solar_power_step = [0.0]
+        self.car_charging_solar_limit = [100.0]
         self.car_charging_solar_min_soc = 0.0
         self.export_window = []
         self.export_limits = []

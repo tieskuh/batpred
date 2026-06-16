@@ -1882,6 +1882,7 @@ class Fetch:
         self.car_charging_solar_max_power = [self.car_charging_rate[c] for c in range(self.num_cars)]
         self.car_charging_solar_min_power = [0.0 for c in range(self.num_cars)]
         self.car_charging_solar_power_step = [0.0 for c in range(self.num_cars)]
+        self.car_charging_solar_limit = [self.car_charging_limit[c] for c in range(self.num_cars)]
 
         self.car_charging_planned_response = self.get_arg("car_charging_planned_response", ["yes", "on", "enable", "true"])
         self.car_charging_now_response = self.get_arg("car_charging_now_response", ["yes", "on", "enable", "true"])
@@ -1934,6 +1935,14 @@ class Fetch:
             # Discrete charge power step (kW). Real chargers only switch in whole current steps (e.g. 1A = ~0.69kW on 3-phase),
             # so they leave a small surplus remainder. 0 = continuous (no quantisation).
             self.car_charging_solar_power_step[car_n] = float(self.get_arg("car_charging_solar_power_step", 0.0, index=car_n))
+
+            # SoC limit (%) the opportunistic solar diversion fills the car to, independent of the grid plan target
+            # (car_charging_limit). Defaults to the grid plan target when not configured. Stored in kWh like car_charging_limit.
+            solar_limit_pct = self.get_arg("car_charging_solar_limit", None, index=car_n)
+            if solar_limit_pct is None:
+                self.car_charging_solar_limit[car_n] = self.car_charging_limit[car_n]
+            else:
+                self.car_charging_solar_limit[car_n] = dp3((float(solar_limit_pct) * self.car_charging_battery_size[car_n]) / 100.0)
 
             # Plugged-in status over the forecast horizon - falls back to "charging now" if no dedicated sensor is configured
             plugged = self.get_arg("car_charging_plugged", None, index=car_n)

@@ -711,7 +711,8 @@ def simple_scenario(
     my_predbat.car_charging_solar_power_step[0] = car_solar_power_step
     my_predbat.car_charging_solar_min_soc = car_solar_min_soc
     if car_charging_solar:
-        my_predbat.car_charging_limit[0] = car_solar_limit
+        # Solar diversion cap (separate from car_charging_limit, the grid plan target)
+        my_predbat.car_charging_solar_limit[0] = car_solar_limit
     my_predbat.inverter_can_charge_during_export = inverter_can_charge_during_export
     my_predbat.charge_scaling10 = charge_scaling10
 
@@ -743,13 +744,14 @@ def simple_scenario(
         pv10_step[minute] = pv_amount / (60 / 5) if pv10 else 0
         load10_step[minute] = load_amount / (60 / 5) if pv10 else 0
 
-    if charge_car:
+    if charge_car or car_charging_solar:
         my_predbat.num_cars = 1
-        my_predbat.car_charging_slots[0] = [{"start": my_predbat.minutes_now, "end": my_predbat.forecast_minutes + my_predbat.minutes_now, "kwh": charge_car * my_predbat.forecast_minutes / 60.0}]
-    elif car_charging_solar:
-        # Opportunistic solar car: no planned grid slots, diversion modelled in the prediction
-        my_predbat.num_cars = 1
-        my_predbat.car_charging_slots[0] = []
+        if charge_car:
+            # Planned (grid) charging slot spanning the horizon; combine with car_charging_solar to test coexistence
+            my_predbat.car_charging_slots[0] = [{"start": my_predbat.minutes_now, "end": my_predbat.forecast_minutes + my_predbat.minutes_now, "kwh": charge_car * my_predbat.forecast_minutes / 60.0}]
+        else:
+            # Opportunistic solar car with no planned grid slots, diversion modelled in the prediction
+            my_predbat.car_charging_slots[0] = []
     else:
         my_predbat.num_cars = 0
         my_predbat.car_charging_slots[0] = []
