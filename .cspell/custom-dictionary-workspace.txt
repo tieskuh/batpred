@@ -115,6 +115,7 @@ energydataservice
 energythroughput
 epod
 euids
+evcc
 evergen
 evse
 exog
@@ -205,6 +206,7 @@ linebreak
 linestyle
 loadml
 loadmlpower
+loadpoint
 loadspower
 localfolder
 locationless
