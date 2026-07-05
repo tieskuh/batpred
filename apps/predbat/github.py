@@ -175,6 +175,13 @@ class GitHub:
                     self.log("Autoupdate: Currently up to date")
                 elif self.releases["this"] == self.releases["latest_beta"]:
                     self.log("Autoupdate: Currently on latest beta")
+                elif self.get_arg("predbat_repository", ""):
+                    # Pinned to a fork via predbat_repository (apps.yaml): the user tracks the fork's
+                    # 'main' branch manually and does not want to be nagged to "update" to an upstream
+                    # release (installing one would replace the fork build with upstream and drop any
+                    # fork-only changes). Log it for visibility but do not flag the HA update entity or
+                    # auto-install.
+                    self.log("Autoupdate: Upstream release {} available but running from fork '{}' - update notification suppressed".format(self.releases["latest"], self.get_arg("predbat_repository", "")))
                 else:
                     latest_version = self.releases["latest"] + " " + self.releases["latest_name"]
                     if auto_update:

@@ -225,6 +225,26 @@ def test_github(my_predbat):
         print("  FAILED: download_predbat_version should NOT be called when auto_update is off")
         failed += 1
 
+    print("  Test 10b: running from a fork (predbat_repository set) suppresses the update notification")
+    _setup(my_predbat)
+    if "auto_update" in my_predbat.config_index:
+        my_predbat.config_index["auto_update"]["value"] = False
+    my_predbat.args["predbat_repository"] = "someuser/batpred"
+    expose_calls = []
+    download_calls = []
+    with patch.object(my_predbat, "download_predbat_releases_url", return_value=releases_data):
+        with patch.object(my_predbat, "expose_config", side_effect=lambda k, v, **kw: expose_calls.append((k, v))):
+            with patch.object(my_predbat, "download_predbat_version", side_effect=lambda v: download_calls.append(v)):
+                my_predbat.download_predbat_releases()
+    my_predbat.args.pop("predbat_repository", None)
+    version_calls = [v for k, v in expose_calls if k == "version"]
+    if not version_calls or version_calls[-1] is not False:
+        print("  FAILED: version (update card) should be suppressed to False when running from a fork, expose calls: {}".format(expose_calls))
+        failed += 1
+    if download_calls:
+        print("  FAILED: download_predbat_version should NOT be called when running from a fork")
+        failed += 1
+
     print("  Test 11: _save_github_url_cache_to_storage prunes entries with non-datetime stamp without raising")
     import shutil
     import tempfile
