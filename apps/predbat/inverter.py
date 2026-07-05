@@ -24,7 +24,7 @@ import pytz
 import requests
 from datetime import datetime, timedelta
 from config import INVERTER_DEF, SOLAX_SOLIS_MODES_NEW, SOLAX_SOLIS_MODES
-from const import MINUTE_WATT, TIME_FORMAT, TIME_FORMAT_OCTOPUS, INVERTER_TEST, TIME_FORMAT_SECONDS, INVERTER_MAX_RETRY, INVERTER_MAX_RETRY_REST
+from const import MINUTE_WATT, TIME_FORMAT, TIME_FORMAT_OCTOPUS, INVERTER_TEST, TIME_FORMAT_SECONDS, INVERTER_MAX_RETRY, INVERTER_MAX_RETRY_REST, INVERTER_REST_TIMEOUT
 from utils import calc_percent_limit, compute_window_minutes, dp0, dp1, dp2, dp3, dp4, time_string_to_stamp, minute_data, minute_data_state, window2minutes
 
 TIME_FORMAT_HMS = "%H:%M:%S"
@@ -733,6 +733,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=1.0,
                         required_unit="%",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                 else:
                     soc_percent = {}
@@ -753,6 +754,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=1.0,
                         required_unit="kWh",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                     # Determine soc_max from nominal_capacity or the observed maximum
                     if nominal_capacity and nominal_capacity > 0:
@@ -779,6 +781,7 @@ class Inverter:
                 divide_by=1.0,
                 scale=1.0,
                 required_unit="W",
+                can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
             )
             if battery_power_invert:
                 # Invert the battery power if required
@@ -1062,6 +1065,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=self.battery_scaling,
                         required_unit="%",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                     for entry in soc_kwh:
                         soc_kwh[entry] = dp4(soc_kwh[entry] * self.soc_max / 100.0)
@@ -1078,6 +1082,7 @@ class Inverter:
                         divide_by=1.0,
                         scale=self.battery_scaling,
                         required_unit="kWh",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                     )
                 charge_rate, ignore_io = minute_data(
                     charge_rate_data[0],
@@ -1091,6 +1096,7 @@ class Inverter:
                     divide_by=1.0,
                     scale=1.0,
                     required_unit="W",
+                    can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                 )
                 predbat_status = minute_data_state(predbat_status_data[0], self.base.max_days_previous, self.base.now_utc, "state", "last_updated")
                 for minute in predbat_status:
@@ -1110,6 +1116,7 @@ class Inverter:
                     divide_by=1.0,
                     scale=1.0,
                     required_unit="W",
+                    can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
                 )
                 if battery_power_invert:
                     # Invert the battery power if required
@@ -1895,14 +1902,16 @@ class Inverter:
             self.base.log("Inverter {} Current charge limit is {}% and new target is {}%".format(self.id, current_soc, soc))
             self.current_charge_limit = soc
             if self.rest_data:
+                # Enable charge target, without it the inverter ignores the target SOC.
+                # rest_enableChargeTarget no-ops if already enabled.
+                self.rest_enableChargeTarget(True)
                 self.rest_setChargeTarget(soc)
             else:
                 self.write_and_poll_value("charge_limit", self.base.get_arg("charge_limit", indirect=False, index=self.id, required_unit="%"), soc)
-
-            charge_limit_enable_entity_id = self.base.get_arg("charge_limit_enable", indirect=False, index=self.id)
-            if charge_limit_enable_entity_id:
-                # If we have a separate enable for the charge limit then make sure it's enabled when we set the charge limit
-                self.write_and_poll_switch("charge_limit_enable", charge_limit_enable_entity_id, True)
+                charge_limit_enable_entity_id = self.base.get_arg("charge_limit_enable", indirect=False, index=self.id)
+                if charge_limit_enable_entity_id:
+                    # If we have a separate enable for the charge limit then make sure it's enabled when we set the charge limit
+                    self.write_and_poll_switch("charge_limit_enable", charge_limit_enable_entity_id, True)
 
             # For inverters that need a button press to apply changes (e.g., Fox), press the button now
             if self.inv_time_button_press:
@@ -3084,7 +3093,12 @@ class Inverter:
         """
         Send REST Command
         """
-        r = requests.post(url, json=json)
+        try:
+            r = requests.post(url, json=json, timeout=INVERTER_REST_TIMEOUT)
+        except Exception as e:
+            self.base.log("Warn: Inverter {} REST POST {} failed: {}".format(self.id, url, e))
+            return None
+        return r
 
     def rest_getData(self, url):
         """
@@ -3093,7 +3107,7 @@ class Inverter:
         r = None
 
         try:
-            r = requests.get(url)
+            r = requests.get(url, timeout=INVERTER_REST_TIMEOUT)
         except Exception as e:
             self.base.log("Error: Exception raised {}".format(e))
 
@@ -3101,6 +3115,37 @@ class Inverter:
             return r.json()
         else:
             return None
+
+    def rest_enableChargeTarget(self, enable):
+        """
+        Enable or disable the charge target SOC limit register via REST.
+        Without this being enabled, CHARGE_TARGET_SOC (reg 116) is ignored by the inverter.
+        No-ops if the register already matches the requested state.
+        """
+        current = self.rest_data["Control"].get("Enable_Charge_Target", "disable")
+        if isinstance(current, str):
+            current = current.lower() in ["enable", "on", "true"]
+        if current == enable:
+            return True
+
+        url = self.rest_api + "/enableChargeTarget"
+        data = {"state": "enable" if enable else "disable"}
+
+        for retry in range(INVERTER_MAX_RETRY_REST):
+            r = self.rest_postCommand(url, json=data)
+            self.rest_data = self.rest_runAll(self.rest_data)
+            new_value = self.rest_data["Control"].get("Enable_Charge_Target", "disable")
+            if isinstance(new_value, str):
+                new_value = new_value.lower() in ["enable", "on", "true"]
+            if new_value == enable:
+                self.count_register_writes += 1
+                self.base.log("Set inverter {} charge target enable {} via REST successful on retry {}".format(self.id, enable, retry))
+                return True
+            self.sleep(2)
+
+        self.base.log("Warn: Set inverter {} charge target enable {} via REST failed".format(self.id, enable))
+        self.base.record_status("Warn: Inverter {} REST failed to enableChargeTarget".format(self.id), had_errors=True)
+        return False
 
     def rest_setChargeTarget(self, target):
         """
