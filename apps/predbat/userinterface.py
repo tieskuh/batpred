@@ -527,6 +527,12 @@ class UserInterface:
                         """UPDATE"""
                         summary = self.releases.get("latest_body", "")
                         latest = self.releases.get("latest", "check HACS")
+                        # When running from a fork (predbat_repository set in apps.yaml) the user tracks the
+                        # fork's main branch manually and does not want the HA update card nagging about
+                        # upstream releases - installing one would replace the fork build. Pin latest to the
+                        # installed version so HA sees no pending update.
+                        if self.get_arg("predbat_repository", ""):
+                            latest = item["installed_version"]
                         state = "off"
                         if item["installed_version"] != latest:
                             state = "on"

@@ -323,4 +323,29 @@ def test_github(my_predbat):
     finally:
         shutil.rmtree(tmpdir2, ignore_errors=True)
 
+    print("  Test 13: on a fork the update entity is pinned to installed (state off) so HA shows no update")
+    _setup(my_predbat)
+    my_predbat.releases = {"latest": "v99.0.0", "latest_body": "future notes"}
+    ver_item = next((i for i in my_predbat.CONFIG_ITEMS if i.get("name") == "version"), None)
+    if ver_item is None:
+        print("  FAILED: no 'version' update config item found")
+        failed += 1
+    else:
+        installed = ver_item.get("installed_version")
+        # Baseline (no fork): the HA update entity flags the pending upstream release
+        my_predbat.args.pop("predbat_repository", None)
+        my_predbat.expose_config("version", True, force_ha=True)
+        ent = my_predbat.ha_interface.dummy_items.get("update.predbat_version", {})
+        if not (isinstance(ent, dict) and ent.get("state") == "on" and ent.get("latest_version") == "v99.0.0"):
+            print("  FAILED: without fork expected state 'on' / latest v99.0.0, got {}".format(ent))
+            failed += 1
+        # With fork: latest pinned to installed so state is off (update card suppressed)
+        my_predbat.args["predbat_repository"] = "someuser/batpred"
+        my_predbat.expose_config("version", True, force_ha=True)
+        ent = my_predbat.ha_interface.dummy_items.get("update.predbat_version", {})
+        my_predbat.args.pop("predbat_repository", None)
+        if not (isinstance(ent, dict) and ent.get("state") == "off" and ent.get("latest_version") == installed):
+            print("  FAILED: with fork expected state 'off' / latest {}, got {}".format(installed, ent))
+            failed += 1
+
     return failed
