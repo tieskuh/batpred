@@ -124,6 +124,7 @@ evergen
 evse
 exog
 exportlimit
+exportvalue
 fdpwr
 fdsoc
 feedin
@@ -154,6 +155,7 @@ Ginlong
 GivEnergy
 givtcp
 gnueabihf
+gridcode
 gridconsumption
 gridconsumptionpower
 growatt
@@ -183,6 +185,7 @@ idag
 idetails
 idxs
 iflux
+importlimit
 inday
 INTELLI
 intelligentdevice
@@ -287,6 +290,7 @@ openweathermap
 overfitting
 overvoltage
 ownerapi
+parseable
 pbat
 pbgw
 pdata
@@ -314,6 +318,7 @@ psum
 pvbat
 pvenergytotal
 pvlib
+pvlimit
 pvpower
 pvwatts
 pwindow
@@ -324,8 +329,10 @@ pytest
 pytz
 randn
 rarr
+reactivepower
 recp
-Redownload
+redownload
+refetches
 regionid
 regname
 remainings
