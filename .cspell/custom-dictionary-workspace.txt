@@ -49,6 +49,7 @@ byok
 cadata
 calib
 Cantarell
+cdn
 cexxxx
 ceyyyy
 chargedischarge
@@ -58,6 +59,7 @@ chargehold
 chargelater
 Chrg
 citem
+cloudfront
 Codespaces
 collapsable
 compareform
@@ -224,6 +226,7 @@ jedlix
 jsyaml
 kaiming
 keepalive
+keydb
 khtml
 killall
 kopt
@@ -481,6 +484,7 @@ varh
 venv
 Victron
 visibilitychange
+waf
 Wallbox
 weblink
 welink
