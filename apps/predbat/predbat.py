@@ -35,7 +35,7 @@ import hass as hass
 import pytz
 import asyncio
 
-THIS_VERSION = "v8.46.4"
+THIS_VERSION = "v8.47.2"
 
 from download import predbat_update_move, predbat_update_download, check_install, DEFAULT_PREDBAT_REPOSITORY
 from const import MINUTE_WATT
@@ -772,7 +772,9 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
                     component_status[component_name] = "error"
                     all_healthy = False
                     error_count += 1
-                    failed_components.append(COMPONENT_LIST.get(component_name, {}).get("name", component_name))
+                    component = self.components.get_component(component_name)
+                    if not component.is_calculating():
+                        failed_components.append(COMPONENT_LIST.get(component_name, {}).get("name", component_name))
                 elif is_active:
                     component_status[component_name] = "running"
                 else:
