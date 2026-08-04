@@ -1128,14 +1128,14 @@ class Fetch:
                 self.car_charging_slots[car_n] = []
                 self.log("Car {} solar charging only (no active plan): no grid slots planned, PV diversion handled in the forecast".format(car_n))
             elif self.car_charging_planned[car_n] or self.car_charging_now[car_n]:
+                limit_percent = dp1(self.car_charging_limit[car_n] / self.car_charging_battery_size[car_n] * 100) if self.car_charging_battery_size[car_n] else 0
                 self.log(
-                    "Car {} plan charging from {} to {}, with slots {} from SoC {}% to {}%, ready by {}".format(
+                    "Car {} plan charging from {}kWh to {}% ({}kWh), with slots {}, ready by {}".format(
                         car_n,
                         self.car_charging_soc[car_n],
+                        limit_percent,
                         self.car_charging_limit[car_n],
                         self.low_rates,
-                        self.car_charging_soc[car_n],
-                        self.car_charging_limit[car_n],
                         self.car_charging_plan_time[car_n],
                     )
                 )
@@ -1292,7 +1292,8 @@ class Fetch:
 
         # Log final car SoC (initialised before the IOG loop, updated per-car after Octopus battery_size is read)
         if self.num_cars:
-            self.log("Cars: SoC: {}kWh, Charge limit {}%, plan time {}, battery size {}kWh".format(self.car_charging_soc, self.car_charging_limit, self.car_charging_plan_time, self.car_charging_battery_size))
+            car_charging_limit_percent = [dp1(limit / size * 100) if size else 0 for limit, size in zip(self.car_charging_limit, self.car_charging_battery_size)]
+            self.log("Cars: SoC: {}kWh, Charge limit {}% ({}kWh), plan time {}, battery size {}kWh".format(self.car_charging_soc, car_charging_limit_percent, self.car_charging_limit, self.car_charging_plan_time, self.car_charging_battery_size))
 
     def fetch_pv_forecast(self):
         """
@@ -2022,8 +2023,9 @@ class Fetch:
                 self.car_charging_plugged[car_n] = bool(plugged)
 
         if self.num_cars > 0:
+            car_charging_limit_percent = [dp1(limit / size * 100) if size else 0 for limit, size in zip(self.car_charging_limit, self.car_charging_battery_size)]
             self.log(
-                "Cars {} charging from battery {} planned {}, charging_now {} smart {}, max_price {}{}, plan_time {}, battery size {}kWh, limit {}%, rate {}kW, exclusive {}".format(
+                "Cars {} charging from battery {} planned {}, charging_now {} smart {}, max_price {}{}, plan_time {}, battery size {}kWh, limit {}% ({}kWh), rate {}kW, exclusive {}".format(
                     self.num_cars,
                     self.car_charging_from_battery,
                     self.car_charging_planned,
@@ -2033,6 +2035,7 @@ class Fetch:
                     self.currency_symbols[1],
                     self.car_charging_plan_time,
                     self.car_charging_battery_size,
+                    car_charging_limit_percent,
                     self.car_charging_limit,
                     self.car_charging_rate,
                     self.car_charging_exclusive,
@@ -2433,7 +2436,6 @@ class Fetch:
         self.battery_temperature_discharge_curve = self.validate_curve(self.args.get("battery_temperature_discharge_curve", {}), "battery_temperature_discharge_curve")
 
         self.import_export_scaling = self.get_arg("import_export_scaling", 1.0)
-        self.best_soc_margin = 0.0
         self.best_soc_min = self.get_arg("best_soc_min")
         self.best_soc_max = self.get_arg("best_soc_max")
         self.best_soc_keep = self.get_arg("best_soc_keep")

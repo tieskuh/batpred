@@ -28,6 +28,7 @@ from tests.test_fetch_config_options import test_fetch_config_options
 from tests.test_multi_inverter import run_inverter_multi_tests
 from tests.test_window2minutes import test_window2minutes
 from tests.test_hass_watcher import test_hass_watcher
+from tests.test_new_install_detection import test_new_install_detection
 from tests.test_history_attribute import test_history_attribute
 from tests.test_inverter import run_inverter_tests
 from tests.test_basic_rates import test_basic_rates
@@ -46,6 +47,7 @@ from tests.test_component_health_status import test_component_health_status
 from tests.test_optimise_levels import run_optimise_levels_tests
 from tests.test_trim_export import run_trim_export_tests
 from tests.test_plan_tiebreak import run_plan_tiebreak_tests
+from tests.test_plan_preclip import run_plan_preclip_tests
 from tests.test_export_commitment import run_export_commitment_tests
 from tests.test_energydataservice import run_energydataservice_tests
 from tests.test_iboost import run_iboost_smart_tests
@@ -156,7 +158,7 @@ from tests.test_balance_inverters import run_balance_inverters_tests
 from tests.test_octopus_download_rates import test_octopus_download_rates_wrapper
 from tests.test_integer_config import test_integer_config_entities, test_expose_config_preserves_integer, test_config_item_range_clamp, test_config_item_step_min_max_types_consistent
 from tests.test_predbat_metrics_data_age import test_data_age_metrics_round_trip
-from tests.test_validate_config import test_validate_config
+from tests.test_validate_config import test_validate_config, test_validate_config_retry
 from tests.test_plan_json_rate_adjust import run_test_plan_json_rate_adjust
 from tests.test_plan_why_reason import run_test_plan_why_reason
 from tests.test_rate_replicate_missing_slots import test_rate_replicate
@@ -268,6 +270,7 @@ def main():
         ("window_sort", run_window_sort_tests, "Window sort tests", False),
         ("window2minutes", test_window2minutes, "Window to minutes tests", False),
         ("hass_watcher", test_hass_watcher, "Standalone-mode file watcher tests (#4397/#4396)", False),
+        ("new_install_detection", test_new_install_detection, "New-install misdetection tests (Bug B, #4397/#4396, #3259, #3306)", False),
         ("compute_metric", run_compute_metric_tests, "Compute metric tests", False),
         ("minute_array", test_minute_array, "MinuteArray class tests", False),
         ("minute_data", test_minute_data, "Minute data tests", False),
@@ -394,6 +397,7 @@ def main():
         ("teslemetry", test_teslemetry, "Teslemetry Tesla Powerwall component tests (data path, control, tariff)", False),
         ("integer_config", test_integer_config_entities, "Integer config entities tests", False),
         ("validate_config", test_validate_config, "APPS_SCHEMA validator tests (string types, sensor boolean states)", False),
+        ("validate_config_retry", test_validate_config_retry, "Config validation retry-after-failure tests (#4379)", False),
         ("expose_config_integer", test_expose_config_preserves_integer, "Expose config preserves integer tests", False),
         ("config_item_range_clamp", test_config_item_range_clamp, "Config item min/max range clamp tests", False),
         ("config_item_step_min_max_types", test_config_item_step_min_max_types_consistent, "Config item step/min/max type consistency tests", False),
@@ -454,6 +458,7 @@ def main():
         ("optimise_levels", run_optimise_levels_tests, "Optimise levels tests", False),
         ("trim_export", run_trim_export_tests, "Export trim ordering (buffer from cheapest slot) tests", False),
         ("plan_tiebreak", run_plan_tiebreak_tests, "Plan fragmentation near-tie tie-break tests", False),
+        ("plan_preclip", run_plan_preclip_tests, "Plan selection scores the pre-clip plan", True),
         ("export_commitment", run_export_commitment_tests, "Forced-export commitment / anti-flapping tests", False),
         ("load_ml", test_load_ml, "ML Load Forecaster tests (MLP, training, persistence, validation)", True),
         # ("optimise_windows", run_optimise_all_windows_tests, "Optimise all windows tests", True),
