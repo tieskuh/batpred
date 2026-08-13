@@ -35,7 +35,7 @@ import hass as hass
 import pytz
 import asyncio
 
-THIS_VERSION = "v8.47.5"
+THIS_VERSION = "v8.48.1"
 
 from download import predbat_update_move, predbat_update_download, check_install, DEFAULT_PREDBAT_REPOSITORY
 from const import MINUTE_WATT
@@ -375,6 +375,10 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.export_more_solar_threshold = 1.0
         self.metric_battery_cycle = 0.0
         self.metric_battery_value_scaling = 1.0
+        self.metric_battery_value_export_scaling = 0.8
+        self.calculate_pv90_plan = False
+        self.pv_metric90_weight = 0.15
+        self.load_scaling90 = 0.7
         self.metric_future_rate_offset_import = 0.0
         self.metric_future_rate_offset_export = 0.0
         self.metric_inday_adjust_damping = 1.0
@@ -429,6 +433,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.rate_export_min_minute = 0
         self.rate_export_max = 0
         self.rate_export_max_minute = 0
+        self.rate_export_max_forward = {}
         self.rate_export_average = 0
         self.rate_gas_min = 0
         self.rate_gas_max = 0
@@ -488,6 +493,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.car_charging_manual_soc = []
         self.car_charging_threshold = 99
         self.car_charging_energy = {}
+        self.car_charging_energy_warned = False
         self.octopus_intelligent_charging = False
         self.octopus_intelligent_ignore_unplugged = False
         self.octopus_intelligent_consider_full = False
@@ -556,6 +562,10 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.load_forecast_array = []
         self.pv_forecast_minute = {}
         self.pv_forecast_minute10 = {}
+        self.pv_forecast_minute90 = {}
+        # (p50, p90) content signatures from the previous plan run, used to spot a p90 that has been
+        # left behind by a p50 reassigned underneath it - see Plan.refresh_pv_forecast_minute90()
+        self.pv_forecast_minute90_signatures = None
         self.load_scaling_dynamic = {}
         self.carbon_intensity = {}
         self.carbon_history = {}
@@ -1602,6 +1612,12 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         """
         Setup the app, called once each time the app starts
         """
+        # Snapshot of apps.yaml exactly as the user wrote it, before Predbat's own defaulting
+        # (auto_config/load_user_config) or any component's automatic_config() touches self.args -
+        # lets ComponentBase.set_arg_auto() tell "user explicitly configured this" apart from
+        # "Predbat defaulted it" or "another component already overwrote it" (issue #4494 follow-up).
+        self.args_from_apps_yaml = copy.deepcopy(self.args)
+        self.apps_yaml_override_warned = set()  # {arg} already warned about via set_arg_auto()
         self.pool = None
         self.log("Predbat: Startup {}".format(__name__))
         self.update_time(print=False)

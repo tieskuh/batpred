@@ -103,6 +103,8 @@ dend
 denorm
 derate
 derating
+desync
+desynced
 devcontainer
 devcontainers
 dexport
@@ -233,6 +235,7 @@ invname
 isinstance
 isoformat
 isort
+itemsize
 itemtype
 ivtime
 jedlix
@@ -295,11 +298,13 @@ misdetect
 misdetected
 misdetecting
 misdetection
+mispairing
 Mixergy
 mkdocs
 mlugg
 Modbus
 mogons
+monkeypatched
 monokai
 Mosquitto
 mpan
@@ -391,6 +396,8 @@ pytz
 randn
 rarr
 reactivepower
+readback
+readbacks
 recp
 redownload
 Referer
@@ -418,6 +425,7 @@ sapm
 saverestore
 savez
 scalarstring
+scalings
 searr
 securetoken
 Segoe
@@ -436,6 +444,10 @@ sigencloud
 sigenergy
 sigenstor
 Slee
+slugified
+slugifies
+slugify
+slugifying
 snakeviz
 socb
 socketloop
@@ -491,6 +503,7 @@ timeobj
 timestep
 timestr
 timezone
+tmpfs
 tmrw
 tojson
 tottime
@@ -501,9 +514,12 @@ treforsiphone
 treforsouthwell
 tunables
 twinx
+typecode
+typecodes
 tzfile
 tzpath
 unconfigured
+undiscounted
 unnormalised
 unparseable
 unsmoothed

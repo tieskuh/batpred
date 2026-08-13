@@ -154,6 +154,18 @@ class Inverter:
         self.reserve_percent = self.base.get_arg("battery_min_soc", default=4.0, index=self.id, required_unit="%")
         self.reserve_percent_current = self.base.get_arg("battery_min_soc", default=4.0, index=self.id, required_unit="%")
         self.battery_scaling = self.base.get_arg("battery_scaling", default=1.0, index=self.id)
+        if not self.battery_scaling or self.battery_scaling <= 0:
+            # A parsed value of exactly 0 (or negative) isn't safe to interpret either way - it could
+            # be a flaky/unavailable API response (e.g. Solis Cloud API returning batteryHealthSoh: 0
+            # during an outage) or a genuinely unhealthy battery, and asserting either "fully healthy"
+            # (1.0) or "no capacity" (0) would be guessing. Retain the last value that was actually
+            # read as valid, rather than inventing one; only fall back to 1.0 if nothing valid has
+            # ever been read for this inverter.
+            last_known = self.base.get_arg("battery_scaling_last_known", default=1.0, index=self.id)
+            self.log("Warn: Inverter {} battery_scaling read as {} which is not a valid scaling factor, retaining last known value {} for this cycle".format(self.id, self.battery_scaling, last_known))
+            self.battery_scaling = last_known
+        else:
+            self.base.set_arg("battery_scaling_last_known", self.battery_scaling, index=self.id)
         self.battery_scaling_config = self.battery_scaling
 
         self.reserve_max = 100
@@ -2811,10 +2823,17 @@ class Inverter:
             self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
 
             # Start discharge or discharge freeze
-            if target_soc == self.soc_percent or freeze:
+            # Only the caller's explicit freeze request should invoke discharge_freeze_service -
+            # reaching the target by ordinary export (target_soc == self.soc_percent with no
+            # freeze) is not a deliberate freeze, it just means there's nothing left to discharge,
+            # so it belongs with the "target already at/above current SoC" stop case below.
+            # Conflating the two used to fire discharge_freeze_service (and any automation wired
+            # to it) whenever export naturally reached its target, regardless of set_export_freeze
+            # (batpred#4464).
+            if freeze:
                 if not self.call_service_template("discharge_freeze_service", service_data, domain="discharge", extra_data=extra_data):
                     self.call_service_template("discharge_start_service", service_data, domain="discharge", extra_data=extra_data)
-            elif target_soc > self.soc_percent:
+            elif target_soc >= self.soc_percent:
                 self.call_service_template("discharge_stop_service", service_data_stop, domain="discharge")
             else:
                 self.call_service_template("discharge_start_service", service_data, domain="discharge", extra_data=extra_data)
@@ -3384,6 +3403,15 @@ class Inverter:
         """
         Configure discharge to percent via REST
         """
+
+        def to_int(value):
+            """GivTCP reports these as strings, so coerce before comparing or a successful write
+            reads back as '4' and never matches the int target."""
+            try:
+                return int(float(value))
+            except (ValueError, TypeError):
+                return None
+
         target = int(target)
         url = self.rest_api + "/setDischargeTarget"
         data = {"dischargeToPercent": target, "slot": 1}
@@ -3391,14 +3419,21 @@ class Inverter:
 
         for retry in range(INVERTER_MAX_RETRY_REST):
             r = self.rest_postCommand(url, json=data)
+            # GivTCP's write handler updates Control.Discharge_Target_SOC_1 synchronously the
+            # moment it accepts the command (confirmed against GivTCP's own source - write.py's
+            # setDischargeTarget() calls updateControlCache() straight after the Modbus write), so
+            # it's checked first. raw.invertor.discharge_target_soc_1 is kept as a fallback, but on
+            # its own it's an unreliable signal: it only refreshes on GivTCP's separate background
+            # self_run poll cycle, which can be tens of seconds away, not synchronous with this
+            # POST at all (#4421). A short settle delay still helps for the much smaller residual
+            # gap - the physical inverter itself taking a moment to apply the write, which a
+            # same-moment self_run poll could otherwise briefly overwrite Control with a stale read
+            # of.
+            self.sleep(1)
             self.rest_data = self.rest_runAll(self.rest_data)
-            # GivTCP reports the raw registers as strings, so coerce before comparing or a
-            # successful write reads back as '4' and never matches the int target
-            result = self.rest_data.get("raw", {}).get("invertor", {}).get("discharge_target_soc_1", None)
-            try:
-                result = int(float(result))
-            except (ValueError, TypeError):
-                result = None
+            result = to_int(self.rest_data.get("Control", {}).get("Discharge_Target_SOC_1", None))
+            if result != target:
+                result = to_int(self.rest_data.get("raw", {}).get("invertor", {}).get("discharge_target_soc_1", None))
             if result == target:
                 self.count_register_writes += 1
                 self.base.log("Inverter {} Set export target slot 1 {} via REST successful after retry {}".format(self.id, data, retry))
