@@ -1320,6 +1320,93 @@ def test_call_service_template(test_name, my_predbat, inv, service_name="test", 
     return failed
 
 
+def test_service_repeat_interval(my_predbat, inv):
+    """
+    Tests repeat_interval rate limiting in call_service_template:
+    identical repeats are skipped while the select entity already reports the
+    requested option, re-asserted at once when it reports something else, and
+    re-issued unconditionally once the keepalive floor expires. A different
+    service (a real mode change) and a restart must always call immediately,
+    and services other than select.select_option honour the time floor alone.
+    """
+    failed = False
+    ha = my_predbat.ha_interface
+    ha.service_store_enable = True
+
+    entity = "select.solaredge_i1_storage_command_mode"
+    option = "Charge from Solar Power and Grid"
+    my_predbat.args["charge_start_service"] = [{"service": "select.select_option", "entity_id": entity, "option": option, "repeat_interval": 30}]
+    expect_call = [["select/select_option", {"entity_id": entity, "option": option}]]
+
+    my_predbat.last_service_hash = {}
+    my_predbat.last_service_time = {}
+    time_base = my_predbat.now_utc
+
+    scenarios = [
+        ("fresh call goes through", 0, "Maximize Self Consumption", True),
+        ("repeat within interval with matching state is skipped", 5, option, False),
+        ("silent revert is re-asserted immediately", 10, "Maximize Self Consumption", True),
+        ("skip returns once the entity reports the option again", 12, option, False),
+        ("unavailable entity forces the call", 20, "unavailable", True),
+        ("keepalive floor expires", 55, option, True),
+    ]
+    for name, offset, entity_state, expect_called in scenarios:
+        print("**** Running Test: repeat_interval {} ****".format(name))
+        my_predbat.now_utc = time_base + timedelta(minutes=offset)
+        ha.dummy_items[entity] = entity_state
+        inv.call_service_template("charge_start_service", {}, domain="charge")
+        expected = expect_call if expect_called else []
+        result = ha.get_service_store()
+        if json.dumps(expected) != json.dumps(result):
+            print("ERROR: repeat_interval {} - service should be {} got {}".format(name, expected, result))
+            failed = True
+
+    # A real mode change arrives as a different service, giving a new hash, and must never be delayed
+    print("**** Running Test: repeat_interval mode change calls immediately ****")
+    freeze_option = "Charge from Clipped Solar Power"
+    my_predbat.args["charge_freeze_service"] = [{"service": "select.select_option", "entity_id": entity, "option": freeze_option, "repeat_interval": 30}]
+    my_predbat.now_utc = time_base + timedelta(minutes=56)
+    ha.dummy_items[entity] = option
+    inv.call_service_template("charge_freeze_service", {}, domain="charge")
+    expected = [["select/select_option", {"entity_id": entity, "option": freeze_option}]]
+    result = ha.get_service_store()
+    if json.dumps(expected) != json.dumps(result):
+        print("ERROR: repeat_interval mode change - service should be {} got {}".format(expected, result))
+        failed = True
+
+    # After a restart the dedup state is empty so the call must go through
+    print("**** Running Test: repeat_interval restart calls immediately ****")
+    my_predbat.last_service_hash = {}
+    my_predbat.last_service_time = {}
+    my_predbat.now_utc = time_base + timedelta(minutes=57)
+    inv.call_service_template("charge_freeze_service", {}, domain="charge")
+    result = ha.get_service_store()
+    if json.dumps(expected) != json.dumps(result):
+        print("ERROR: repeat_interval restart - service should be {} got {}".format(expected, result))
+        failed = True
+
+    # Services other than select.select_option are rate limited on the time floor alone
+    my_predbat.last_service_hash = {}
+    my_predbat.last_service_time = {}
+    my_predbat.args["keepalive_service"] = [{"service": "funny_service", "dummy": "1", "repeat_interval": 30}]
+    non_select = [["funny_service", {"dummy": "1"}]]
+    for name, offset, expect_called in [("non-select fresh call", 0, True), ("non-select within interval", 5, False), ("non-select floor expired", 31, True)]:
+        print("**** Running Test: repeat_interval {} ****".format(name))
+        my_predbat.now_utc = time_base + timedelta(minutes=offset)
+        inv.call_service_template("keepalive_service", {}, domain="discharge")
+        expected = non_select if expect_called else []
+        result = ha.get_service_store()
+        if json.dumps(expected) != json.dumps(result):
+            print("ERROR: repeat_interval {} - service should be {} got {}".format(name, expected, result))
+            failed = True
+
+    my_predbat.now_utc = time_base
+    my_predbat.last_service_hash = {}
+    my_predbat.last_service_time = {}
+    ha.service_store_enable = False
+    return failed
+
+
 def test_charge_window_none_illegal_time(test_name, my_predbat, dummy_items):
     """
     Test charge window handling when time is illegal (e.g., 'unknown')
@@ -2855,6 +2942,10 @@ charge_start_service:
 
     inv.soc_percent = 49
 
+    if failed:
+        return failed
+
+    failed |= test_service_repeat_interval(my_predbat, inv)
     if failed:
         return failed
 
