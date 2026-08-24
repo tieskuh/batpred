@@ -2886,7 +2886,7 @@ class Inverter:
             return ""
         try:
             since_call_minutes = (self.base.now_utc - last_time).total_seconds() / 60
-        except TypeError:
+        except (TypeError, AttributeError):
             return ""
         if since_call_minutes < 0 or since_call_minutes >= repeat_interval:
             return ""
@@ -2971,7 +2971,9 @@ class Inverter:
                 service_name = service_name.replace(".", "/")
                 self.log("Inverter {} Calling service {} domain {} service_name {} with data {}".format(self.id, service, domain, service_name, service_data))
                 self.base.call_service_wrapper(service_name, **service_data)
-                self.base.last_service_time[hash_index] = self.base.now_utc
+                now_utc = getattr(self.base, "now_utc", None)
+                if now_utc is not None:
+                    self.base.last_service_time[hash_index] = now_utc
             else:
                 self.log("Warn: Inverter {} unable to find service name for {}".format(self.id, service))
 
