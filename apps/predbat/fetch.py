@@ -1149,7 +1149,7 @@ class Fetch:
                     self.log("Car {} on Octopus Intelligent, active plan for charge".format(car_n))
                 else:
                     self.log("Car {} on Octopus Intelligent, no active plan".format(car_n))
-            elif self.car_charging_solar[car_n] and not self.car_charging_planned[car_n]:
+            elif car_n < len(self.car_charging_solar) and self.car_charging_solar[car_n] and not self.car_charging_planned[car_n]:
                 # Opportunistic solar charging with no departure plan: do not plan any grid/low-rate slots.
                 # The PV diversion is modelled directly in the prediction (see prediction.py), so the home
                 # battery forecast still accounts for the energy the car takes, without scheduling grid charging.
