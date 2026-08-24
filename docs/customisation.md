@@ -77,6 +77,22 @@ Predbat has a toggle switch called **switch.predbat_expert_mode** which is set t
 A lot of Predbat's more advanced configuration options will not be available unless expert mode is turned On.
 It's recommended for new users to start without expert mode and then maybe turn it on later once you become more confident with the tool.
 
+## Performance tweaks mode
+
+Predbat has a second toggle switch called **switch.predbat_performance_tweaks** which is also Off by default.
+
+Behind it sit the options that trade planning time for plan quality. They are all turned **On** by default, so out of the box Predbat
+produces the best plan it can - you only need this toggle if your machine struggles to keep up. Turning it On reveals the switches so
+you can turn individual features Off and buy back CPU time.
+
+While the toggle is Off each hidden option runs at its default, so there is nothing to configure and nothing to go wrong. Note that a
+hidden option is pinned to its default and cannot be overridden from `apps.yaml` - turn this toggle On if you need to hold one of them Off.
+
+Currently behind this toggle:
+
+- **switch.predbat_calculate_second_pass** - the full second-pass optimisation
+- **switch.predbat_calculate_pv90_plan** - the PV90% upside scenario
+
 ## Performance related
 
 Predbat controls the inverter every 5 minutes it runs, and by default, updates and recalculates the plan every 10 minutes.
@@ -85,7 +101,14 @@ This can however use a lot of CPU power especially on more complex tariffs like 
 You can tweak **input_number.predbat_calculate_plan_every** (_expert mode_) (default 10 minutes) to reduce the frequency of replanning while keeping the inverter control in the fixed 5-minute slots.
 E.g. a value of 10 or 15 minutes should also give good results.
 
-If you have performance problems leave **switch.predbat_calculate_second_pass** (_expert mode_) turned Off as it's quite CPU intensive and provides very little improvement for most systems.
+If you have performance problems, turn On **switch.predbat_performance_tweaks** to reveal the two switches that cost the most planning time. Both are On by
+default because both improve the plan; turn them Off to buy the time back:
+
+- **switch.predbat_calculate_pv90_plan** - simulating the third (sunny) scenario is the larger of the two costs
+- **switch.predbat_calculate_second_pass** - re-optimises every window in the plan rather than just the near-term ones
+
+As a rough guide, on a 20-scenario benchmark of one-day plans, turning both Off returns planning time to about three quarters of what it takes with them On.
+The second pass in particular gets more expensive the longer your plan is, so on a two-day horizon it costs proportionally more than that.
 
 You can turn on **switch.predbat_combine_charge_slots** and **switch.predbat_combine_export_slots** (_expert mode_) to speed up planning.
 Note: Combining export slots may prevent optimal forced export. Combining charge slots is usually fine for tariffs with longer periods of fixed rates but can limit the planning ability in some cases.
@@ -220,10 +243,10 @@ A value of 0.1 assumes that 1 in every 10 times we will get the Solcast 10% scen
 Predbat estimates solar generation for each half-hour slot to be a pv_metric10_weight weighting of the Solcast 10% PV forecast to the Solcast Median forecast.<BR>
 A value of 0.15 (the default) is recommended. Do not enter a value above 1.0 (e.g. 30 for "30%") - Predbat will clamp it back into range and log a warning, but the resulting plan is likely to look very wrong in the meantime.
 
-**switch.predbat_calculate_pv90_plan** When turned On, enables the PV90% upside scenario described below - it is Off by default, and the
-PV90% scenario is not simulated at all while it is Off (no extra planning time is spent on it), regardless of what `pv_metric90_weight` is set to.
-This switch is deliberately available without expert mode, as the PV90% scenario is new and we would like feedback on it from as many systems as possible.
-The two settings that tune it (`pv_metric90_weight` and `load_scaling90`) remain expert-mode only, so everyone who turns the switch on is running the same
+**switch.predbat_calculate_pv90_plan** (_performance tweaks_) enables the PV90% upside scenario described below - it is **On by default**.
+Turn it Off (after turning on **switch.predbat_performance_tweaks** to reveal it) and the PV90% scenario is not simulated at all, saving that
+planning time, regardless of what `pv_metric90_weight` is set to.
+The two settings that tune it (`pv_metric90_weight` and `load_scaling90`) remain expert-mode only, so everyone running the PV90% scenario is using the same
 values and their results are comparable.
 
 **input_number.predbat_pv_metric90_weight** (_expert mode_) is a weighting, expressed as a fraction between 0.0 and 1.0 (not a whole-number percentage), given to the Solcast 90% PV scenario in calculating solar generation.
@@ -231,10 +254,10 @@ It is the upside mirror of `pv_metric10_weight` above: where the PV10% scenario 
 (the 90% PV forecast) combined with a lower household load (see `load_scaling90` above).
 Predbat blends the three simulated futures into one metric, so a value of 0.1 assumes that 1 in every 10 times we will get the Solcast 90% scenario.
 
-**The default is 0.15, but the feature is inert until `switch.predbat_calculate_pv90_plan` above is turned On** - while the switch is Off, Predbat forces the
-running weight to 0.0 regardless of this setting, so no PV90% simulation is run and the plan is exactly as it would be without this setting. Only turn the
-switch on if you specifically want Predbat to give weight to the possibility of a better-than-forecast day; doing so will make Predbat somewhat less willing
-to charge from the grid, since it now prices in a chance of more free solar than the central forecast predicts.
+**The default is 0.15 and `switch.predbat_calculate_pv90_plan` above is On by default, so this weight is live.** Turning that switch Off forces the
+running weight to 0.0 regardless of this setting, so no PV90% simulation is run and the plan is exactly as it would be without this setting. Giving weight to
+the possibility of a better-than-forecast day makes Predbat somewhat less willing to charge from the grid, since it now prices in a chance of more free solar
+than the central forecast predicts.
 If `pv_metric10_weight` and `pv_metric90_weight` together exceed 1.0 they are scaled back proportionally so the central scenario is never given a negative weighting.
 
 **switch.predbat_metric_pv_calibration_enable** When turned On (the default), Predbat will use your historical solar generation data to calibrate your PV production estimates on a slot duration (default 30 minute) basis.<BR>
@@ -312,9 +335,9 @@ This prevents Predbat from planning unnecessary forced exports during sunny peri
 
 **switch.predbat_inverter_set_charge_before** - (_expert_mode_) When turned On (the default), charge slots will be programmed before their start time, when Off they will only be configured when the charging time starts.
 
-**switch.predbat_calculate_second_pass** (_expert mode_) When turned On causes Predbat to perform a second pass optimisation across all the charge and export windows in time order.
+**switch.predbat_calculate_second_pass** (_performance tweaks_) When turned On (the default) causes Predbat to perform a second pass optimisation across all the charge and export windows in time order.
 
-Note: This feature is quite slow so may need a higher-performance machine so is turned Off by default.
+Note: This feature is quite slow, so turn On **switch.predbat_performance_tweaks** and switch it Off if your machine is struggling.
 
 This can help to slightly improve the plan for tariffs like Agile but can make it worse in some fixed rate tariffs in which you want to force export late.
 
@@ -786,7 +809,9 @@ This is described in detail in [Manual API](manual-api.md) and is mentioned here
 - Secondly Predbat will create a debug output file 'debug/predbat_debug_HH_MM_SS.yaml' in a subfolder of the Predbat installation directory.
 This file contains a full export of your current Predbat config and is extremely useful to enable recreating your setup to diagnose issues. Any sensitive information such as Solcast or GivEnergy Cloud API keys are automatically removed.
 
-The following automation might be useful to automatically turn off Predbat debug mode after turning it on to capture the debug logs:
+Predbat automatically turns this switch back Off after 2 hours if it's still on, to bound the raw disk writes it triggers if left on by accident - if you need a longer debug session than that, you'll need to turn it back On again.
+
+The following automation might be useful to automatically turn off Predbat debug mode sooner than that, after turning it on to capture the debug logs:
 
 ```yaml
 alias: "Predbat: Auto turn-off debug mode"
@@ -815,6 +840,17 @@ mode: single
 ```
 
 **switch.predbat_plan_debug** (_expert mode_) when turned On adds some extra debug to the Predbat HTML plan - see [Predbat Plan debug mode](predbat-plan-card.md#debug-mode-for-predbat-plan) for more details. Off by default.
+
+### Debug history
+
+Turning on `switch.predbat_debug_enable` only captures debug information from the moment you switch it on - not much help if you have already noticed a problem and want to see what Predbat was doing an hour or two ago. Predbat also keeps a small rolling history of debug snapshots automatically, independent of that switch, so there is always some recent history to look back at:
+
+- **switch.predbat_debug_history_enable** - turns the rolling history off entirely when off (default on). `debug_history_force_capture` still works even while this is off.
+- **input_number.predbat_debug_history_count** - how many snapshots to retain (default 15, minimum 1 - use the enable switch above to turn the feature off, not a count of 0).
+- **input_number.predbat_debug_history_interval** - how many hours between automatic snapshots (default 3). With the defaults, 15 snapshots at 3-hourly intervals covers just under 48 hours.
+- **switch.predbat_debug_history_force_capture** - turn this on to trigger an immediate snapshot rather than waiting for the next scheduled one, useful from an automation that has just spotted something worth investigating. Predbat resets the switch back off itself once the snapshot has been taken, and still takes the snapshot even if `debug_history_enable` is off.
+
+Retained snapshots can all be downloaded together as a single `.tgz` archive from a link on the web interface's dashboard **Debug** panel, or individually from the **Debug** column shown on the plan's **History** view (next to any time slot a snapshot was captured for exactly). An automation can also fetch the most recent snapshot directly without needing to know its exact timestamp, by calling `GET <predbat-url>/debug_history_download?id=latest` after turning `switch.predbat_debug_history_force_capture` on.
 
 ## Updating Predbat
 

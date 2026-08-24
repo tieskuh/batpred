@@ -18,9 +18,11 @@ phase order. Routes HA events to components based on entity prefix filtering.
 """
 
 from storage import StorageComponent
+from alphaess import AlphaESSAPI
 from solcast import SolarAPI
 from gecloud import GECloudDirect, GECloudData
 from ohme import OhmeAPI
+from myenergi import MyEnergiAPI
 from octopus import OctopusAPI
 from carbon import CarbonAPI
 from temperature import TemperatureAPI
@@ -35,6 +37,7 @@ from ha import HAInterface, HAHistory
 from db_manager import DatabaseManager
 from fox import FoxAPI
 from deye import DeyeAPI
+from sunsynk import SunsynkAPI
 from enphase import EnphaseAPI
 from kraken import KrakenAPI
 from web_mcp import PredbatMCPServer
@@ -198,12 +201,52 @@ COMPONENT_LIST = {
                 "required": True,
                 "config": "ohme_password",
             },
+            "ohme_automatic": {
+                "required": False,
+                "default": False,
+                "config": "ohme_automatic",
+            },
+            "ohme_control": {
+                "required": False,
+                "default": False,
+                "config": "ohme_control",
+            },
+            # Deliberately has no default: unset means "auto-detect from the Octopus component",
+            # which is distinct from an explicit False meaning "never use Ohme for the car slots"
             "ohme_automatic_octopus_intelligent": {
                 "required": False,
                 "config": "ohme_automatic_octopus_intelligent",
             },
         },
         "phase": 1,
+    },
+    "myenergi": {
+        "class": MyEnergiAPI,
+        "name": "myenergi Zappi/Eddi",
+        "event_filter": "predbat_myenergi_",
+        "args": {
+            "auth_method": {"required": False, "config": "myenergi_auth_method", "default": "direct"},
+            "hub_serial": {"required": False, "config": "myenergi_hub_serial"},
+            "api_key": {"required": False, "config": "myenergi_api_key"},
+            "key": {"required": False, "config": "myenergi_key"},
+            "token_expires_at": {"required": False, "config": "myenergi_token_expires_at"},
+            "token_hash": {"required": False, "config": "myenergi_token_hash"},
+            "automatic": {"required": False, "config": "myenergi_automatic", "default": True},
+            "enable_controls": {"required": False, "config": "myenergi_enable_controls", "default": True},
+            "poll_seconds": {"required": False, "config": "myenergi_poll_seconds", "default": 60},
+            "zappi_control": {"required": False, "config": "myenergi_zappi_control", "default": False},
+        },
+        # Gate activation on having at least one auth path — api_key is the direct
+        # transport's local hub credential, key is the cloud transport's access token.
+        # Without this the component would start for every instance since all
+        # individual args are optional to allow either auth mode.
+        # api_key is the direct transport's credential; key (the OAuth access token) and
+        # token_hash (which the refresh chain exchanges for one) are the cloud transport's.
+        # token_hash has to be listed too: a refresh-only OAuth setup carries no key, and
+        # initialize() accepts that, so gating on key alone would never construct it.
+        "required_or": ["api_key", "key", "token_hash"],
+        "phase": 1,
+        "can_restart": True,
     },
     "fox": {
         "class": FoxAPI,
@@ -279,6 +322,67 @@ COMPONENT_LIST = {
         # instance that has no usable token and then fails on every API call.
         "required_or": ["app_id", "key"],
         "phase": 1,
+    },
+    "sunsynk": {
+        "class": SunsynkAPI,
+        "name": "Sunsynk Cloud",
+        "event_filter": "predbat_sunsynk_",
+        "args": {
+            "username": {"required": False, "config": "sunsynk_username"},
+            "password": {"required": False, "config": "sunsynk_password"},
+            # In oauth mode OAuthMixin assigns 'key' straight to access_token (see
+            # oauth_mixin._init_oauth). Predbat.com injects the access token as
+            # sunsynk_key; without this entry it is dropped and every call is rejected.
+            "key": {"required": False, "config": "sunsynk_key"},
+            "region": {"required": False, "default": "sunsynk", "config": "sunsynk_region"},
+            "auth_method": {"required": False, "default": "password", "config": "sunsynk_auth_method"},
+            "token_expires_at": {"required": False, "config": "sunsynk_token_expires_at"},
+            "token_hash": {"required": False, "config": "sunsynk_token_hash"},
+            "inverter_sn": {"required": False, "config": "sunsynk_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "sunsynk_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "sunsynk_automatic_ignore_pv"},
+            # On by default, matching solis_control_enable: an inverter component that does
+            # not drive the inverter is not what a user configuring it expects. Set false for
+            # monitoring only - worth doing while the inferred write format is unconfirmed
+            # against live hardware (see the VERIFY@SPIKE notes in sunsynk_const.py).
+            "control_enable": {"required": False, "default": True, "config": "sunsynk_control_enable"},
+            # Battery capacity arrives in amp-hours, so it needs a pack voltage to become
+            # kWh. Normally inferred from the BMS charge target; this is the escape hatch
+            # for a pack that does not report one.
+            "battery_nominal_voltage": {"required": False, "config": "sunsynk_battery_nominal_voltage"},
+        },
+        # Gate activation on having at least one auth path — a username (self-hosted) OR
+        # an injected SaaS access token. Without this the component would start for every
+        # instance, since all individual args are optional to allow either auth mode.
+        "required_or": ["username", "key"],
+        "phase": 1,
+    },
+    "alphaess": {
+        "class": AlphaESSAPI,
+        "name": "AlphaESS Cloud API",
+        "event_filter": "predbat_alphaess_",
+        "args": {
+            "app_id": {"required": False, "config": "alphaess_app_id"},
+            "app_secret": {"required": False, "config": "alphaess_app_secret"},
+            "inverter_sn": {"required": False, "config": "alphaess_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "alphaess_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "alphaess_automatic_ignore_pv"},
+            # On by default, matching sunsynk_control_enable: an inverter component that does
+            # not drive the inverter is not what a user configuring it expects. Set false for
+            # monitoring only. switch.predbat_set_read_only still gates every write.
+            "control_enable": {"required": False, "default": True, "config": "alphaess_control_enable"},
+            # The API reports no battery power limit and no pack current/voltage to derive
+            # one from, so it is estimated from poinv. This is the escape hatch for a user
+            # who knows their pack's real limit.
+            "battery_rate_max": {"required": False, "config": "alphaess_battery_rate_max"},
+            "api_delay": {"required": False, "default": 2, "config": "alphaess_api_delay"},
+            "min_write_interval": {"required": False, "default": 300, "config": "alphaess_min_write_interval"},
+        },
+        # Gate activation on having an AppID. Without this the component would start for
+        # every instance, since all individual args are optional.
+        "required_or": ["app_id"],
+        "phase": 1,
+        "can_restart": True,
     },
     "enphase": {
         "class": EnphaseAPI,
@@ -487,6 +591,7 @@ COMPONENT_LIST = {
             "automatic": {"required": False, "config": "solis_automatic", "default": False},
             "base_url": {"required": False, "config": "solis_base_url", "default": "https://www.soliscloud.com:13333"},
             "control_enable": {"required": False, "config": "solis_control_enable", "default": True},
+            "nominal_voltage": {"required": False, "config": "solis_nominal_voltage"},
         },
         # Gate activation on having at least one auth path — HMAC (api_key) OR OAuth
         # (access_token). Without this the component would start for every instance

@@ -8,7 +8,6 @@
 # pylint: disable=line-too-long
 # pylint: disable=attribute-defined-outside-init
 
-
 """Base inverter abstraction layer.
 
 Provides the unified Inverter class that abstracts control of different
@@ -24,10 +23,19 @@ import pytz
 import requests
 from datetime import datetime, timedelta
 from config import INVERTER_DEF, SOLAX_SOLIS_MODES_NEW, SOLAX_SOLIS_MODES
-from const import MINUTE_WATT, TIME_FORMAT, TIME_FORMAT_OCTOPUS, INVERTER_TEST, TIME_FORMAT_SECONDS, INVERTER_MAX_RETRY, INVERTER_MAX_RETRY_REST, INVERTER_REST_TIMEOUT
+from const import MINUTE_WATT, TIME_FORMAT, TIME_FORMAT_OCTOPUS, INVERTER_TEST, TIME_FORMAT_SECONDS, INVERTER_MAX_RETRY, INVERTER_MAX_RETRY_REST, INVERTER_REST_TIMEOUT, EXPORT_LIMIT_IDLE
+from control_ledger import generation_from_state, OWNED, UNOWNED
 from utils import calc_percent_limit, compute_window_minutes, dp0, dp1, dp2, dp3, dp4, time_string_to_stamp, minute_data, minute_data_state, window2minutes
 
 TIME_FORMAT_HMS = "%H:%M:%S"
+
+
+# GivTCP raw.invertor.model values confirmed not to support the Discharge_Target_SOC_1 register
+# (#4517). "Ac" (AC Coupled) and "Hybrid_gen1" are confirmed live - the latter on two separate
+# reporter inverters, still repeating the write every cycle post-fix until added here.
+# "Hybrid_gen2" is inferred from the same GivEnergy firmware-archive generational split
+# (github.com/DJBenson/giv-firmware), not independently confirmed on real Gen2 hardware yet.
+DISCHARGE_TARGET_UNSUPPORTED_MODELS = ("Ac", "Hybrid_gen1", "Hybrid_gen2")
 
 
 class Inverter:
@@ -1152,7 +1160,11 @@ class Inverter:
                 else:
                     search_range = range(99, 85, -1)
 
-                # Find 100% end points
+                # Find 100% end points. The exact-match checks below ("Charging" / "Exporting",
+                # "Discharging") deliberately exclude "Cross-charging" minutes - during genuine
+                # cross-charging another inverter is simultaneously drawing/feeding power at the
+                # same time, so this inverter's battery_power reading isn't a clean single-inverter
+                # charge/discharge sample and would corrupt the learned curve if included.
                 for data_point in search_range:
                     for minute in range(1, min_len):
                         # Start trigger is when the SoC just increased above the data point
@@ -1183,9 +1195,9 @@ class Inverter:
                             # Find a period where charging was at full rate and the SoC just drops below the data point
                             for target_minute in range(minute, min_len):
                                 this_soc = soc_percent.get(target_minute, 0)
-                                if not discharge and (predbat_status.get(target_minute, "") != "Charging" or charge_rate.get(minute, 0) < max_power_scaled or battery_power.get(minute, 0) >= 0):
+                                if not discharge and (predbat_status.get(target_minute, "") != "Charging" or charge_rate.get(target_minute, 0) < max_power_scaled or battery_power.get(target_minute, 0) >= 0):
                                     break
-                                if discharge and (not ((predbat_status.get(target_minute, "") in ["Exporting", "Discharging"])) or charge_rate.get(minute, 0) < max_power_scaled or battery_power.get(minute, 0) <= 0):
+                                if discharge and (not ((predbat_status.get(target_minute, "") in ["Exporting", "Discharging"])) or charge_rate.get(target_minute, 0) < max_power_scaled or battery_power.get(target_minute, 0) <= 0):
                                     break
 
                                 if (discharge and (this_soc > data_point)) or (not discharge and (this_soc < data_point)):
@@ -1231,8 +1243,10 @@ class Inverter:
 
                                     break
                                 else:
-                                    # Store data
-                                    total_power += abs(battery_power.get(minute, 0))
+                                    # Store data for this minute of the period, so total_power/total_count
+                                    # below is the mean power across the whole SoC step rather than the
+                                    # reading at the single minute the step was triggered on
+                                    total_power += abs(battery_power.get(target_minute, 0))
                                     total_count += 1
                 if final_curve:
                     # Average the data points
@@ -1456,7 +1470,7 @@ class Inverter:
 
         if not quiet:
             self.base.log(
-                "Inverter {} SoC: {}kW {}%, current charge rate {}W, current discharge rate {}W, current battery power {}W, current battery voltage {}V, grid power {}W, load power {}W, PV Power {}W".format(
+                "Inverter {} SoC: {}kWh {}%, current charge rate {}W, current discharge rate {}W, current battery power {}W, current battery voltage {}V, grid power {}W, load power {}W, PV Power {}W".format(
                     self.id,
                     dp2(self.soc_kw),
                     self.soc_percent,
@@ -1479,14 +1493,42 @@ class Inverter:
             elif "charge_start_time" in self.base.args:
                 charge_start_time = time_string_to_stamp(self.base.get_arg("charge_start_time", index=self.id))
                 charge_end_time = time_string_to_stamp(self.base.get_arg("charge_end_time", index=self.id))
+            elif self.rest_api or self.base.get_arg("ge_cloud_direct", False, indirect=False):
+                # A data source IS configured but hasn't returned anything this cycle - genuinely
+                # transient (a fetch hiccup, or before the first poll on a fresh start), so fall
+                # through to the same safe-defaults/retry-next-update handling below as a
+                # configured-but-currently-unusable value, rather than crashing the whole plan for
+                # something that should resolve itself.
+                #
+                # ge_cloud_direct belongs here as much as givtcp_rest does. The original comment
+                # named GivEnergy cloud "no devices" as the case this branch exists to catch, but
+                # gating solely on self.rest_api made that unreachable: ge_cloud_direct sets neither
+                # rest_api nor charge_start_time (it auto-configures the charge window at runtime,
+                # from the device the cloud returns), so a cloud-backed instance whose fetch fails
+                # fell straight past this into the permanent-setup-gap branch below.
+                charge_start_time = None
+                charge_end_time = None
             else:
-                self.log("Error: Inverter {} unable to read charge window time as neither REST, charge_start_time or charge_start_hour are set".format(self.id))
-                self.base.record_status("Error: Inverter {} unable to read charge window time as neither REST, charge_start_time or charge_start_hour are set".format(self.id), had_errors=True)
-                raise ValueError
+                # No data source is configured at all - a permanent setup gap, not something that
+                # will resolve on its own. Retrying every cycle forever would be misleading, so
+                # don't pretend to make a plan Predbat can't actually deliver (maintainer call on
+                # #4288/#4179 - see PR review discussion).
+                message = "Error: Inverter {} unable to read charge window time - no source is configured (set givtcp_rest, ge_cloud_direct, or charge_start_time/charge_start_hour in apps.yaml)".format(self.id)
+                self.log(message)
+                self.base.record_status(message, had_errors=True)
+                raise ValueError(message)
 
             if charge_start_time is None or charge_end_time is None:
-                self.log("Warn: Inverter {} unable to read charge window time as charge_start_time or charge_end_time is None, will retry next update".format(self.id))
-                self.base.record_status("Warn: Inverter {} unable to read charge window time, will retry next update".format(self.id), had_errors=True)
+                # Name the source that came back empty. This is the message a user now actually
+                # sees when a configured source is failing, so "charge_start_time is None" on its
+                # own sends them looking at apps.yaml - which is the one thing that is fine. The
+                # real cause is upstream: a cloud account with no devices attached, revoked or
+                # rotated API credentials, or a lapsed entitlement, none of which Predbat can tell
+                # apart from here beyond naming where the data should have come from.
+                source = "GE Cloud" if (not self.rest_api and self.base.get_arg("ge_cloud_direct", False, indirect=False)) else "REST"
+                hint = "check the {} credentials and that the account still has this inverter attached".format(source)
+                self.log("Warn: Inverter {} unable to read charge window time - {} returned no data, {}, will retry next update".format(self.id, source, hint))
+                self.base.record_status("Warn: Inverter {} unable to read charge window time - {} returned no data, {}".format(self.id, source, hint), had_errors=True)
                 # Set safe defaults to allow graceful recovery on next update
                 self.charge_enable_time = False
                 self.charge_start_time_minutes = self.base.forecast_minutes
@@ -1643,7 +1685,7 @@ class Inverter:
         if self.discharge_enable_time:
             self.export_limits = [0.0 for i in range(len(self.export_window))]
         else:
-            self.export_limits = [100.0 for i in range(len(self.export_window))]
+            self.export_limits = [EXPORT_LIMIT_IDLE for i in range(len(self.export_window))]
 
         # Idle time?
         # Get previous idle start and end
@@ -1843,12 +1885,18 @@ class Inverter:
                     self.write_and_poll_value("charge_rate", self.base.get_arg("charge_rate", indirect=False, index=self.id, required_unit="W"), new_rate, fuzzy=(self.battery_rate_max_charge * MINUTE_WATT / 20), required_unit="W")
                 if "charge_rate_percent" in self.base.args:
                     self.write_and_poll_value("charge_rate_percent", self.base.get_arg("charge_rate_percent", indirect=False, index=self.id, required_unit="%"), min(int(new_rate / self.battery_rate_max_raw * 100), 100), fuzzy=5, required_unit="%")
-                if self.inv_output_charge_control == "current":
-                    self.set_current_from_power("charge", new_rate)
 
             if notify and self.base.set_inverter_notify:
                 self.base.call_notify("Predbat: Inverter {} charge rate changes to {}W at {}".format(self.id, new_rate, self.base.time_now_str()))
             self.mqtt_message(topic="set/charge_rate", payload=new_rate)
+
+        # Re-assert the timed current register on every call, not just when charge_rate itself
+        # changes - it's a separate register that can drift/reset independently (#4415). Mirrors
+        # the pattern used for the charge window time registers in adjust_charge_window(): call
+        # every cycle and let write_and_poll_value()'s own read-compare decide whether a write is
+        # actually needed, which is a no-op when nothing has drifted.
+        if not self.rest_data and self.inv_output_charge_control == "current":
+            self.set_current_from_power("charge", new_rate)
 
     def adjust_discharge_rate(self, new_rate, notify=True):
         """
@@ -1881,12 +1929,18 @@ class Inverter:
                     self.write_and_poll_value("discharge_rate", self.base.get_arg("discharge_rate", indirect=False, index=self.id), new_rate, fuzzy=(self.battery_rate_max_discharge * MINUTE_WATT / 20), required_unit="W")
                 if "discharge_rate_percent" in self.base.args:
                     self.write_and_poll_value("discharge_rate_percent", self.base.get_arg("discharge_rate_percent", indirect=False, index=self.id, required_unit="%"), min(int(new_rate / self.battery_rate_max_raw * 100), 100), fuzzy=5, required_unit="%")
-                if self.inv_output_charge_control == "current":
-                    self.set_current_from_power("discharge", new_rate)
 
             if notify and self.base.set_inverter_notify:
                 self.base.call_notify("Predbat: Inverter {} discharge rate changes to {}W at {}".format(self.id, new_rate, self.base.time_now_str()))
             self.mqtt_message(topic="set/discharge_rate", payload=new_rate)
+
+        # Re-assert the timed current register on every call, not just when discharge_rate itself
+        # changes - it's a separate register that can drift/reset independently (#4415). Mirrors
+        # the pattern used for the charge window time registers in adjust_charge_window(): call
+        # every cycle and let write_and_poll_value()'s own read-compare decide whether a write is
+        # actually needed, which is a no-op when nothing has drifted.
+        if not self.rest_data and self.inv_output_charge_control == "current":
+            self.set_current_from_power("discharge", new_rate)
 
     def adjust_battery_target(self, soc, isCharging=False, isExporting=False):
         """
@@ -1952,6 +2006,36 @@ class Inverter:
             else:
                 self.mimic_target_soc(0)
 
+    def _ledger_generation(self, entity_id):
+        """Return the entity's observation generation, or None if it exposes no timing metadata.
+
+        The ledger requires a divergent read to be NEWER than the confirmation, not merely
+        from a later cycle - GivEnergy serves bulk settings reads from cache, so a read taken
+        before our write propagated shows the old value and is indistinguishable from a
+        reversion. Where an entity exposes no timing metadata the ledger falls back to the
+        cycle counter alone, which is weaker but never wrong in the unsafe direction.
+        """
+        try:
+            return generation_from_state(self.base.get_state_wrapper(entity_id, raw=True))
+        except Exception:
+            return None
+
+    def _ledger_observe(self, ledger, name, entity_id, value):
+        """Classify a control read and log every verdict that is not a plain owned/unowned.
+
+        observe()'s verdict is otherwise discarded at all three call sites, which makes the
+        whole suppression ladder invisible. When a customer reports interference and the
+        entity reads 0 there is then no way to tell whether the ledger owned nothing,
+        suppressed on the freshness gate, refused the read as implausible, saw a dropout, or
+        had been wiped by a service template - four completely different problems that look
+        identical from outside. This line is the feature's only diagnostic.
+        """
+        owned = ledger.owned_value(entity_id)
+        verdict = ledger.observe(entity_id, name, value, now=time.time(), generation=self._ledger_generation(entity_id))
+        if verdict not in (OWNED, UNOWNED):
+            self.base.log("Inverter {} control ledger: {} ({}) verdict {} - Predbat set {}, inverter now reads {}".format(self.id, name, entity_id, verdict, owned, value))
+        return verdict
+
     def write_and_poll_switch(self, name, entity_id, new_value):
         """
         GivTCP Workaround, keep writing until correct
@@ -1964,8 +2048,19 @@ class Inverter:
         domain, entity_name = entity_id.split(".")
 
         current_state = self.base.get_state_wrapper(entity_id=entity_id)
+        # The ledger is shown the RAW read, taken before the boolean coercion below. That
+        # coercion maps "unavailable" to False, which is a perfectly valid switch position -
+        # a routine integration dropout would otherwise pass every suppression rung and be
+        # reported to the customer as somebody else turning their charging off.
+        raw_state = current_state
         if isinstance(current_state, str):
             current_state = current_state.lower() in ["on", "enable", "true"]
+
+        ledger = self.base.control_ledger
+        if ledger is not None:
+            self._ledger_observe(ledger, name, entity_id, raw_state)
+            if current_state != new_value:
+                ledger.note_write_attempt(entity_id)
 
         if current_state == new_value:
             self.base.log("Inverter {} write_and_poll_switch: No write needed for {} as {} == {}".format(self.id, name, new_value, current_state))
@@ -1986,6 +2081,7 @@ class Inverter:
 
             self.sleep(self.inv_write_and_poll_sleep)
             current_state = self.base.get_state_wrapper(entity_id=entity_id, refresh=domain != "sensor")
+            raw_state = current_state
             if isinstance(current_state, str):
                 current_state = current_state.lower() in ["on", "enable", "true"]
 
@@ -1993,10 +2089,20 @@ class Inverter:
             self.base.log("Inverter {} Wrote {} to {} successfully and got {}".format(self.id, name, new_value, self.base.get_state_wrapper(entity_id=entity_id)))
             if domain != "sensor":
                 self.count_register_writes += 1
+            # The owned value must be the same SHAPE as the reads it will later be compared
+            # against, so record_write gets the raw read too. Storing the coerced bool while
+            # observing the raw string would make every subsequent read ("on" vs True) look
+            # like a change - PredBat accusing somebody else of its own successful write.
+            if ledger is not None:
+                ledger.record_write(entity_id, name, raw_state, now=time.time(), generation=self._ledger_generation(entity_id))
             return True
         else:
             self.base.log("Warn: Inverter {} Trying to write {} to {} didn't complete got {}".format(self.id, name, new_value, self.base.get_state_wrapper(entity_id=entity_id)))
             self.base.record_status("Warn: Inverter {} write to {} failed".format(self.id, name), had_errors=True)
+            # The write never verified, so we cannot claim this value - and holding the PREVIOUS
+            # confirmation would report the next read of a control we have just failed to set.
+            if ledger is not None:
+                ledger.clear(entity_id)
             return False
 
     def write_and_poll_value(self, name, entity_id, new_value, fuzzy=0, ignore_fail=False, required_unit=None):
@@ -2009,6 +2115,12 @@ class Inverter:
         domain, entity_name = entity_id.split(".")
         current_state = self.base.get_state_wrapper(entity_id, required_unit=required_unit)
 
+        # The ledger is shown the RAW read, taken before the float coercion below. That
+        # coercion turns a failed read - "unavailable", "unknown", a missing entity - into
+        # 0.0, which is a real-looking number that passes every suppression rung. Reported
+        # to a customer that reads as "a third party set your charge rate to 0 W", produced
+        # by nothing more than a routine integration dropout.
+        raw_state = current_state
         if isinstance(new_value, str):
             matched = current_state == new_value
         else:
@@ -2018,6 +2130,12 @@ class Inverter:
                 self.log("Warn: Inverter {} write_and_poll_value: Current state for {} is {}".format(self.id, name, current_state))
                 current_state = 0.0
             matched = abs(current_state - new_value) <= fuzzy
+
+        ledger = self.base.control_ledger
+        if ledger is not None:
+            self._ledger_observe(ledger, name, entity_id, raw_state)
+            if not matched:
+                ledger.note_write_attempt(entity_id)
 
         retry = 0
         while (not matched) and (retry < INVERTER_MAX_RETRY):
@@ -2031,10 +2149,15 @@ class Inverter:
                 self.base.call_service_wrapper(service, value=new_value_conv, entity_id=entity_id)
 
             if ignore_fail:
+                # Returns success without ever polling, so nothing has been proved about what
+                # the inverter now holds - drop ownership rather than claim it.
+                if ledger is not None:
+                    ledger.clear(entity_id)
                 return True
 
             self.sleep(self.inv_write_and_poll_sleep)
             current_state = self.base.get_state_wrapper(entity_id, refresh=domain != "sensor", required_unit=required_unit)
+            raw_state = current_state
             if isinstance(new_value, str):
                 matched = current_state == new_value
             else:
@@ -2051,10 +2174,17 @@ class Inverter:
             self.base.log(f"Inverter {self.id} write_and_poll_value: Wrote {new_value} to {name}, successfully now {current_state}")
             if domain != "sensor":
                 self.count_register_writes += 1
+            # Raw again, for the same reason as observe() above: both sides of every later
+            # comparison must be reads of the same entity in the same shape, and a coerced
+            # 0.0 read-back would otherwise be stored as a confirmed owned value.
+            if ledger is not None:
+                ledger.record_write(entity_id, name, raw_state, fuzzy=fuzzy, now=time.time(), generation=self._ledger_generation(entity_id))
             return True
         else:
             self.base.log(f"Warn: Inverter {self.id} Trying to write {new_value} to {name} didn't complete got {current_state}")
             self.base.record_status(f"Warn: Inverter {self.id} write to {name} failed", had_errors=True)
+            if ledger is not None:
+                ledger.clear(entity_id)
             return False
 
     def write_and_poll_option(self, name, entity_id, new_value, ignore_fail=False):
@@ -2080,6 +2210,12 @@ class Inverter:
         if old_value and (":" in old_value) and (":" in new_value) and (len(old_value) == 5) and (len(new_value) == 8):
             new_value = new_value[:5]
 
+        ledger = self.base.control_ledger
+        if ledger is not None:
+            self._ledger_observe(ledger, name, entity_id, old_value)
+            if old_value != new_value:
+                ledger.note_write_attempt(entity_id)
+
         for retry in range(INVERTER_MAX_RETRY):
             if entity_base == "time":
                 service = entity_base + "/set_value"
@@ -2091,15 +2227,22 @@ class Inverter:
                 service = entity_base + "/select_option"
                 self.base.call_service_wrapper(service, option=new_value, entity_id=entity_id)
             if ignore_fail:
+                # Same as write_and_poll_value: success without a poll proves nothing.
+                if ledger is not None:
+                    ledger.clear(entity_id)
                 return True
             self.sleep(self.inv_write_and_poll_sleep)
             old_value = self.base.get_state_wrapper(entity_id, refresh=True)
             if old_value == new_value:
                 self.base.log("Inverter {} Wrote {} to {} successfully".format(self.id, name, new_value))
                 self.count_register_writes += 1
+                if ledger is not None:
+                    ledger.record_write(entity_id, name, old_value, now=time.time(), generation=self._ledger_generation(entity_id))
                 return True
         self.base.log("Warn: Inverter {} Trying to write {} to {} didn't complete got {}".format(self.id, name, new_value, self.base.get_state_wrapper(entity_id, refresh=True)))
         self.base.record_status("Warn: Inverter {} write to {} failed".format(self.id, name), had_errors=True)
+        if ledger is not None:
+            ledger.clear(entity_id)
         return False
 
     def adjust_pause_mode(self, pause_charge=False, pause_discharge=False):
@@ -2511,13 +2654,15 @@ class Inverter:
         if force_export:
             target_soc = int(self.reserve_percent)
             if self.rest_data and self.rest_v3:
-                if "raw" in self.rest_data and "invertor" in self.rest_data["raw"] and "discharge_target_soc_1" in self.rest_data["raw"]["invertor"]:
-                    current = self.rest_data["raw"]["invertor"]["discharge_target_soc_1"]
-                    try:
-                        current = float(current)
-                    except (ValueError, TypeError) as e:
-                        current = None
-
+                # Some GivTCP inverter models don't have a working Discharge_Target_SOC_1 register -
+                # GivTCP still reports a write as successful, but it never persists between cycles, so
+                # the caller sees a permanent mismatch and rewrites indefinitely (#4517). See
+                # DISCHARGE_TARGET_UNSUPPORTED_MODELS above for what's confirmed vs inferred.
+                inverter_model = self.rest_data.get("raw", {}).get("invertor", {}).get("model", "")
+                if inverter_model in DISCHARGE_TARGET_UNSUPPORTED_MODELS:
+                    self.log("Inverter {} is {}, discharge target register not supported, export target not written".format(self.id, inverter_model))
+                else:
+                    current = self.rest_readDischargeTarget()
                     if current is None:
                         self.log("Inverter {} No current discharge target to read, export target not written".format(self.id))
                     elif current != target_soc:
@@ -2687,6 +2832,8 @@ class Inverter:
         """
         if self.inv_has_mqtt_api:
             self.base.call_service_wrapper("mqtt/publish", qos=1, retain=True, topic=(self.inv_mqtt_topic + "/" + topic), payload=payload)
+            # No ledger call: this publishes to a broker topic and maps to no Home Assistant
+            # entity, so there is nothing here to record against one.
 
     def enable_charge_discharge_with_time_current(self, direction, enable):
         """
@@ -2712,7 +2859,12 @@ class Inverter:
 
     def set_current_from_power(self, direction, power):
         """
-        Set the timed charge/discharge current setting by converting power to current
+        Set the timed charge/discharge current setting by converting power to current.
+
+        Called on every adjust_charge_rate()/adjust_discharge_rate() invocation, not just when
+        the power target itself changes - this register can drift or get reset independently
+        (#4415). write_and_poll_value() already no-ops when the live value already matches, so
+        this is cheap when nothing has drifted.
         """
         new_current = round(power / self.battery_voltage, self.inv_current_dp)
         self.write_and_poll_value(f"timed_{direction}_current", self.base.get_arg(f"timed_{direction}_current", indirect=False, index=self.id), new_current, fuzzy=1)
@@ -2861,10 +3013,14 @@ class Inverter:
         service_data_stop = {"device_id": self.base.get_arg("device_id", index=self.id, default="")}
         extra_data = {"discharge_start_time": self.base.get_arg("discharge_start_time", index=self.id, default="00:00:00"), "discharge_end_time": self.base.get_arg("discharge_end_time", index=self.id, default="00:00:00")}
         if target_soc < 100:
+            # Mirrors adjust_charge_immediate()'s charge_start_service payload just above - the
+            # actual (possibly low-power-scaled) rate already set via adjust_discharge_rate(), not
+            # always the inverter's maximum, which produced a full-power discharge_start_service
+            # call even during a planned low-power export (batpred#4619).
             service_data = {
                 "device_id": self.base.get_arg("device_id", index=self.id, default=""),
                 "target_soc": int(target_soc),
-                "power": int(self.battery_rate_max_discharge * MINUTE_WATT),
+                "power": int(self.get_current_discharge_rate()),
             }
 
             # Stop charge
@@ -3446,6 +3602,32 @@ class Inverter:
         self.base.log("Warn: Inverter {} set charge slot 1 {} via REST failed".format(self.id, data))
         self.base.record_status("Warn: Inverter {} REST failed to setChargeSlot1".format(self.id), had_errors=True)
         return False
+
+    def rest_readDischargeTarget(self):
+        """
+        Read GivTCP's currently applied discharge target percent, or None if it can't be read.
+
+        Mirrors rest_setDischargeTarget()'s own preference order: Control.Discharge_Target_SOC_1 is
+        GivTCP's synchronous write-time signal, updated the moment a write is accepted, so it's
+        checked first. raw.invertor.discharge_target_soc_1 is a fallback for GivTCP setups where
+        Control doesn't expose the key - but on its own it's unreliable as a "did this actually
+        change" signal, since it only refreshes on GivTCP's separate background self_run poll cycle,
+        not synchronously with any write. A caller that reads raw.invertor alone to decide whether a
+        write is even needed can end up re-writing every cycle on hardware where that field never
+        catches up (#4421, #4517).
+        """
+        if not isinstance(self.rest_data, dict):
+            return None
+        try:
+            result = int(float(self.rest_data.get("Control", {}).get("Discharge_Target_SOC_1", None)))
+        except (ValueError, TypeError):
+            result = None
+        if result is None:
+            try:
+                result = int(float(self.rest_data.get("raw", {}).get("invertor", {}).get("discharge_target_soc_1", None)))
+            except (ValueError, TypeError):
+                result = None
+        return result
 
     def rest_setDischargeTarget(self, target):
         """

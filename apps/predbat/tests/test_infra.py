@@ -9,7 +9,8 @@
 # pylint: disable=attribute-defined-outside-init
 
 from datetime import datetime, timedelta
-from prediction import wrapped_run_prediction_single, Prediction
+from const import PREDBAT_MAX_CARS, MINUTE_WATT
+from prediction import Prediction
 from matplotlib import pyplot as plt
 import asyncio
 import numpy as np
@@ -145,6 +146,7 @@ class TestHAInterface:
         self.dummy_items = {}
         self.service_store_enable = False
         self.service_store = []
+        self.service_store_fail = set()
         self.db_primary = False
 
     def get_service_store(self):
@@ -188,7 +190,10 @@ class TestHAInterface:
         print("Calling service: {} {}".format(service, kwargs))
         if self.service_store_enable:
             self.service_store.append([service, kwargs])
-            return None
+            # Services in service_store_fail simulate a service that doesn't exist (e.g. testing a
+            # try-new-service-then-fall-back-to-old caller) - everything else succeeds, matching real
+            # HA behaviour for a registered service call.
+            return None if service in self.service_store_fail else True
 
         if service == "number/set_value":
             entity_id = kwargs.get("entity_id", None)
@@ -404,8 +409,14 @@ class MockConfigProvider:
             "inverter_clock_skew_discharge_end": 0,
             "set_window_minutes": 0,
             # Car charging config for each car (postfix _0, _1, etc.)
-            "car_charging_rate_0": 7400,
-            "car_charging_rate_1": 7400,
+            "car_charging_rate_0": 7.4,
+            "car_charging_rate_1": 7.4,
+            "car_charging_rate_2": 7.4,
+            "car_charging_rate_3": 7.4,
+            "car_charging_rate_4": 7.4,
+            "car_charging_rate_5": 7.4,
+            "car_charging_rate_6": 7.4,
+            "car_charging_rate_7": 7.4,
             "car_charging_battery_size_0": 100.0,
             "car_charging_battery_size_1": 100.0,
             "car_charging_limit_0": 100.0,
@@ -507,8 +518,8 @@ def reset_inverter(my_predbat):
     my_predbat.num_cars = 0
     my_predbat.car_charging_slots[0] = []
     my_predbat.car_charging_from_battery = True
-    my_predbat.car_charging_limit = [100.0, 100.0, 100.0, 100.0]
-    my_predbat.car_charging_soc = [0, 0, 0, 0]
+    my_predbat.car_charging_limit = [100.0] * PREDBAT_MAX_CARS
+    my_predbat.car_charging_soc = [0] * PREDBAT_MAX_CARS
     my_predbat.iboost_enable = False
     my_predbat.iboost_solar = False
     my_predbat.iboost_gas = False
@@ -521,7 +532,7 @@ def reset_inverter(my_predbat):
     my_predbat.best_soc_keep = 0.0
     my_predbat.carbon_enable = 0
     my_predbat.inverter_soc_reset = True
-    my_predbat.car_charging_soc_next = [None for car_n in range(4)]
+    my_predbat.car_charging_soc_next = [None for car_n in range(PREDBAT_MAX_CARS)]
     my_predbat.charge_limit_best = []
     my_predbat.charge_window_best = []
     my_predbat.export_limits_best = []
@@ -580,6 +591,7 @@ def simple_scenario(
     charge_window_best=[],
     charge_limit_best=None,
     inverter_loss=1.0,
+    inverter_freeze_export_discharge_rate=0.0,
     battery_rate_max_charge=1.0,
     battery_rate_max_charge_dc=None,
     charge_car=0,
@@ -609,6 +621,7 @@ def simple_scenario(
     keep=0.0,
     keep_weight=0.5,
     assert_keep=0.0,
+    assert_battery_cycle=None,
     save="best",
     quiet=False,
     iboost_rate_threshold=9999,
@@ -698,6 +711,7 @@ def simple_scenario(
     my_predbat.pv_ac_limit = pv_ac_limit / 60.0
     my_predbat.reserve = reserve
     my_predbat.inverter_loss = inverter_loss
+    my_predbat.inverter_freeze_export_discharge_rate = inverter_freeze_export_discharge_rate / MINUTE_WATT
     my_predbat.battery_rate_max_charge = battery_rate_max_charge / 60.0
     my_predbat.battery_rate_max_charge_dc = battery_rate_max_charge_dc / 60.0
     my_predbat.battery_rate_max_discharge = battery_rate_max_charge / 60.0
@@ -828,7 +842,7 @@ def simple_scenario(
             metric_keep,
             final_iboost,
             final_carbon_g,
-        ) = wrapped_run_prediction_single(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), step=5)
+        ) = prediction.thread_run_prediction_single(charge_limit_best, charge_window_best, export_window_best, export_limit_best, pv10, end_record=(my_predbat.end_record), step=5)
     else:
         (
             metric,
@@ -867,6 +881,10 @@ def simple_scenario(
     if abs(final_soc - assert_final_soc) >= 0.1:
         if not ignore_failed:
             print("ERROR: Final SOC {} should be {}".format(final_soc, assert_final_soc))
+        failed = True
+    if assert_battery_cycle is not None and abs(battery_cycle - assert_battery_cycle) >= 0.001:
+        if not ignore_failed:
+            print("ERROR: Battery cycle {} should be {}".format(battery_cycle, assert_battery_cycle))
         failed = True
     if abs(final_iboost - assert_final_iboost) >= 0.1:
         if not ignore_failed:

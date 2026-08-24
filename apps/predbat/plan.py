@@ -13,20 +13,61 @@
 
 Implements the search algorithm that finds optimal charge and discharge windows
 by exploring combinations of price thresholds, window sizes, and SoC targets.
-Uses multi-threaded prediction runs to evaluate thousands of scenarios and select
-the plan that minimises the overall cost metric.
+The search itself is serial Python: each fan-out queues its scenarios through
+launch_run_prediction_* and the first handle read flushes them all through one
+call to the C++ prediction kernel, which is where the threading now lives.
 """
 
-import copy
-import traceback
 from datetime import datetime, timedelta
-from multiprocessing import Pool, cpu_count
-from const import PREDICT_STEP, PV_SCENARIO_NOMINAL, PV_SCENARIO_PV10, PV_SCENARIO_PV90, TIME_FORMAT, MINUTE_WATT
-from utils import calc_percent_limit, dp0, dp1, dp2, dp3, dp4, remove_intersecting_windows, calc_percent_limit, in_car_slot
-from prediction import Prediction, wrapped_run_prediction_single, wrapped_run_prediction_charge, wrapped_run_prediction_charge_min_max, wrapped_run_prediction_export, wrapped_run_prediction_charge_min_max
-from prediction_kernel import kernel_status_summary
+from multiprocessing import cpu_count
+from const import PREDICT_STEP, PV_SCENARIO_NOMINAL, PV_SCENARIO_PV10, PV_SCENARIO_PV90, TIME_FORMAT, MINUTE_WATT, EXPORT_LIMIT_FREEZE, EXPORT_LIMIT_IDLE
+
+from utils import calc_percent_limit, clone_windows, dp0, dp1, dp2, dp3, dp4, remove_intersecting_windows, in_car_slot
+from prediction import Prediction
+from prediction_kernel import kernel_status_summary, set_window_start
 from predbat_metrics import metrics
 import time
+
+# How many windows the post-settle plan pass revisits when calculate_second_pass is off. The near-term
+# windows are the ones about to be executed, so a small budget keeps the common path cheap; raising it
+# picks up value further out at a proportional cost in planning time.
+PLAN_PASS_WINDOW_BUDGET = 8
+
+
+def resolve_batch_threads(threads, cpu_count_value):
+    """Map the threads setting onto how many kernel lanes one batch may use.
+
+    'auto' takes the core count and is deliberately not capped. On a fast machine the curve is very
+    flat and peaks slightly below the core count - measured on the 20-scenario benchmark, best of 3:
+    serial 26.33s, 4 threads 24.89s, 6 threads 24.71s, 8 threads 24.91s, 16 threads 25.04s - so a cap
+    looks attractive. But re-running with each job made eight times dearer, which is how a machine
+    where the kernel dominates behaves, the curve stops turning over entirely: 48.92s serial, 32.03s
+    at 4, 29.98s at 6, 29.85s at 8, 28.94s at 16.
+
+    That makes the risk asymmetric. Capping at 4 costs 0.7% on the fast machine but 10.7% on the
+    kernel-heavy one, while not capping costs 1.3% at worst. The worst case for a low cap is far
+    worse than the worst case for none, so 'auto' is left alone and anyone who wants fewer lanes sets
+    threads: explicitly.
+    """
+    if threads == "auto":
+        return max(cpu_count_value, 1)
+    return max(int(threads), 1)
+
+
+# Octopus Intelligent (IOG) charge-skew gradient.
+# io_adjusted (planned-dispatch) slots are at-risk: Octopus may move or remove them later.
+# Instead of a flat penalty we apply a signed per-hour gradient across each contiguous IOG
+# run: the earliest slots are discounted (ranked below equally-priced firm slots, so they
+# are filled first) while the latest slots are penalised (so distant, more-likely-to-vanish
+# IOG slots are not relied upon). Firm slots sit neutrally in the middle at the pivot point.
+# The discount only applies to imminent slots (within IO_ADJUST_DISCOUNT_HORIZON_HOURS of
+# now); distant future dispatch periods keep only the penalty side until they draw closer,
+# which is re-evaluated every optimisation cycle.
+IO_ADJUST_SLOPE = 1.0  # Pence per hour into the IOG run
+IO_ADJUST_PIVOT_HOURS = 1.5  # Hours into the run where the adjustment crosses zero (firm level)
+IO_ADJUST_MAX_DISCOUNT = 3.0  # Maximum pence discount applied to the earliest IOG slots
+IO_ADJUST_MAX_PENALTY = 10.0  # Maximum pence penalty applied to the latest IOG slots
+IO_ADJUST_DISCOUNT_HORIZON_HOURS = 3.0  # Only discount IOG slots that start within this many hours of now
 
 
 def slots_around(target_slots, slot_lengths):
@@ -38,6 +79,38 @@ def slots_around(target_slots, slot_lengths):
         if slot_length <= (target_slots * 2) and slot_length >= (target_slots // 2):
             slot_choices.append(slot_length)
     return slot_choices
+
+
+def select_window_candidates(entries, price_selected, allow_freeze, accept=None):
+    """
+    Ordered, deduplicated list of (window_n, freeze) that a price threshold makes available.
+
+    entries is a [price, window_n, freeze] list for one side of the search, in the order the
+    optimiser considers them. A window is taken when its price passes price_selected, its freeze
+    flag is allowed by allow_freeze, it has not already been taken, and accept (when given) passes
+    it. Only taken windows count as seen, so a window that accept rejects is offered again if it
+    appears later - which is what the capped scan this replaces did.
+
+    The result is deliberately unbounded: capping at max_slots is the caller slicing the first
+    max_slots off the front. That equivalence holds because the cap in the original scan was
+    monotonic - once reached, nothing further was ever taken - and it is what lets one scan per
+    price threshold serve every slot count the search tries. test_window_selection pins it against
+    a reference implementation of the original capped loop.
+    """
+    chosen = []
+    seen = set()
+    for price, window_n, freeze in entries:
+        if not price_selected(price):
+            continue
+        if freeze and not allow_freeze:
+            continue
+        if window_n in seen:
+            continue
+        if accept is not None and not accept(window_n):
+            continue
+        seen.add(window_n)
+        chosen.append((window_n, freeze))
+    return chosen
 
 
 MASK_64 = (1 << 64) - 1
@@ -58,32 +131,14 @@ def scenario_hash_entry(kind, window_n, value):
     return acc ^ (acc >> 31)
 
 
-"""
-Used to mimic threads when they are disabled
-"""
-
-
-class DummyThread:
-    def __init__(self, result):
-        """
-        Store the data into the class
-        """
-        self.result = result
-        time.sleep(0)  # Yield control
-
-    def get(self):
-        """
-        Return the result
-        """
-        return self.result
-
-
 class Plan:
     """Plan optimisation mixin for finding optimal charge/discharge windows.
 
     Implements the search algorithm that explores price thresholds,
-    window combinations, and SoC targets using multi-threaded prediction
-    runs to minimise the overall cost metric.
+    window combinations, and SoC targets to minimise the overall cost
+    metric. Scenarios are evaluated in batches: launch_run_prediction_*
+    queues them and reading the first handle runs the whole batch through
+    one C++ kernel call, which spreads it across its own threads.
     """
 
     def dynamic_load(self):
@@ -227,7 +282,7 @@ class Plan:
                 elif typ == "d":
                     if price == real_lowest_price_export:
                         continue
-                    if export_limits[window_n] < 99.0:
+                    if export_limits[window_n] < EXPORT_LIMIT_FREEZE:
                         if lowest_price_export is None:
                             lowest_price_export = export_window[window_n]["average"]
                         else:
@@ -366,7 +421,7 @@ class Plan:
                         else:
                             price_set_export.append([price, window_n, typ == "df"])
                             valid_export_windows[window_n] = True
-                            best_export_limits_reset[window_n] = 100.0
+                            best_export_limits_reset[window_n] = EXPORT_LIMIT_IDLE
 
         FINE_SLOT_LENGTHS = [48, 32, 24, 16, 14, 12, 10, 8, 6, 5, 4, 3, 2, 1, 0]
         COARSE_SLOT_LENGTHS = [32, 16, 8, 4, 2, 1, 0]
@@ -390,7 +445,7 @@ class Plan:
         export_hash_delta = {}
         for window_n in valid_export_windows:
             reset_contribution = scenario_hash_entry(1, window_n, best_export_limits_reset[window_n])
-            export_hash_delta[window_n] = {True: scenario_hash_entry(1, window_n, 99.0) - reset_contribution, False: scenario_hash_entry(1, window_n, min_freeze_percent) - reset_contribution}
+            export_hash_delta[window_n] = {True: scenario_hash_entry(1, window_n, EXPORT_LIMIT_FREEZE) - reset_contribution, False: scenario_hash_entry(1, window_n, min_freeze_percent) - reset_contribution}
 
         # Which charge window an export window collides with is a purely geometric question, and this
         # function only ever turns windows on and off - it never moves a window's start or end. So the
@@ -400,6 +455,28 @@ class Plan:
         # for 221 distinct answers. Only the collision itself is cached - the limit that follows from it
         # depends on charge_mods/best_limits_reset and changes from trial to trial.
         hit_charge_cache = {}
+        hit_car_cache = {}  # (start, end) -> does this window hit a car charging slot
+        export_allowed_cache = {}  # window_n -> is this export window usable at all
+
+        def export_window_allowed(window_n):
+            """Whether an export window may be exported at all, ignoring charge window collisions.
+
+            Car charging and iboost collisions depend only on the window's own fixed geometry, so
+            like hit_charge_cache above the answer holds for the life of the call. The charge window
+            collision is deliberately not folded in here - that one depends on charge_mods and so
+            changes from trial to trial.
+            """
+            allowed = export_allowed_cache.get(window_n)
+            if allowed is None:
+                window = export_window[window_n]
+                if not self.car_charging_from_battery and self.hit_car_window(window["start"], window["end"], cache=hit_car_cache):
+                    allowed = False
+                elif not self.iboost_on_export and self.iboost_enable and self.iboost_plan and (self.hit_charge_window(self.iboost_plan, window["start"], window["end"]) >= 0):
+                    allowed = False
+                else:
+                    allowed = True
+                export_allowed_cache[window_n] = allowed
+            return allowed
 
         # Start loop of trials
         for loop_price in all_prices:
@@ -409,6 +486,49 @@ class Plan:
                     if self.debug_enable:
                         self.log("Skipping price {} as level score {} is not within 20% of best {}".format(loop_price, this_level_score, best_level_score))
                     continue
+
+            # Which windows a price threshold makes available depends only on the threshold and the
+            # freeze flag - not on the slot counts swept below, and not on coarse vs fine. So each
+            # side is scanned once per (threshold, freeze) here and every slot count is served by
+            # slicing that one list, rather than rescanning price_set_* inside the four nested slot
+            # loops. That scan was the hottest loop left in planning: ~900 rescans of a few hundred
+            # entries per threshold, for at most a couple of dozen distinct answers.
+            #
+            # Slicing is exactly what capping did - see select_window_candidates - and slot counts at
+            # or above the candidate count all select the same windows, so they collapse onto one
+            # cache entry rather than one per entry in the slot length list.
+            charge_candidates = {}
+            export_candidates = {}
+            charge_selection_cache = {}
+            export_selection_cache = {}
+
+            def charge_selection_for(max_slots, allow_freeze, loop_price=loop_price):
+                """Charge windows this price threshold selects, capped at max_slots"""
+                candidates = charge_candidates.get(allow_freeze)
+                if candidates is None:
+                    candidates = select_window_candidates(price_set_charge, lambda price: loop_price >= price, allow_freeze)
+                    charge_candidates[allow_freeze] = candidates
+                count = min(max_slots, len(candidates))
+                entry = charge_selection_cache.get((count, allow_freeze))
+                if entry is None:
+                    taken = candidates[:count]
+                    entry = ([window_n for window_n, _ in taken], dict(taken))
+                    charge_selection_cache[(count, allow_freeze)] = entry
+                return entry
+
+            def export_selection_for(max_slots, allow_freeze, loop_price=loop_price):
+                """Export windows this price threshold selects, capped at max_slots"""
+                candidates = export_candidates.get(allow_freeze)
+                if candidates is None:
+                    candidates = select_window_candidates(price_set_export, lambda price: loop_price < price, allow_freeze, accept=export_window_allowed)
+                    export_candidates[allow_freeze] = candidates
+                count = min(max_slots, len(candidates))
+                entry = export_selection_cache.get((count, allow_freeze))
+                if entry is None:
+                    taken = candidates[:count]
+                    entry = ([window_n for window_n, _ in taken], dict(taken))
+                    export_selection_cache[(count, allow_freeze)] = entry
+                return entry
 
             for coarse in [True, False] if enable_coarse_fine else [False]:
                 if not enable_coarse_fine:
@@ -429,40 +549,17 @@ class Plan:
                     for max_export_slots in export_slot_choices:
                         for try_charge_freeze in charge_freeze_options:
                             for try_export_freeze in export_freeze_options:
-                                all_n = []
-                                all_d = []
-                                count_c = 0
-                                count_d = 0
-                                charge_mods = {}  # window_n -> freeze flag, for charge windows modified from the reset limits
-                                export_mods = {}  # window_n -> freeze flag, for export windows modified from the reset limits
-
-                                for price, window_n, freeze in price_set_charge:
-                                    if loop_price >= price:
-                                        if freeze and not try_charge_freeze:
-                                            pass
-                                        elif count_c < max_charge_slots and (window_n not in charge_mods):
-                                            all_n.append(window_n)
-                                            charge_mods[window_n] = freeze
-                                            count_c += 1
-
-                                for price, window_n, freeze in price_set_export:
-                                    if loop_price < price:
-                                        # For prices above threshold try export
-                                        if freeze and not try_export_freeze:
-                                            pass
-                                        elif count_d < max_export_slots and (window_n not in export_mods):
-                                            if not self.car_charging_from_battery and self.hit_car_window(export_window[window_n]["start"], export_window[window_n]["end"]):
-                                                pass
-                                            elif not self.iboost_on_export and self.iboost_enable and self.iboost_plan and (self.hit_charge_window(self.iboost_plan, export_window[window_n]["start"], export_window[window_n]["end"]) >= 0):
-                                                pass
-                                            else:
-                                                all_d.append(window_n)
-                                                export_mods[window_n] = freeze
-                                                count_d += 1
+                                # all_n is copied into pred_item below and charge_mods is only ever read,
+                                # so both cached objects can be shared between trials as they stand. The
+                                # export pair can be pruned just below, so it is copied on write.
+                                all_n, charge_mods = charge_selection_for(max_charge_slots, try_charge_freeze)
+                                all_d, export_mods = export_selection_for(max_export_slots, try_export_freeze)
 
                                 # Remove export hitting charge windows if this is disabled
                                 if not self.calculate_export_oncharge:
-                                    for window_n in all_d[:]:
+                                    pruned_all_d = None
+                                    pruned_export_mods = None
+                                    for window_n in all_d:
                                         hit_charge = hit_charge_cache.get(window_n)
                                         if hit_charge is None:
                                             hit_charge = self.hit_charge_window(self.charge_window_best, export_window[window_n]["start"], export_window[window_n]["end"])
@@ -476,8 +573,14 @@ class Plan:
                                                 # Only remove if it doesn't remove the charge window entirely
                                                 if not (export_window[window_n]["start"] <= self.charge_window_best[hit_charge]["start"] and export_window[window_n]["end"] >= self.charge_window_best[hit_charge]["end"]):
                                                     # Dropping the modification restores the reset value (100.0) for this window
-                                                    export_mods.pop(window_n, None)
-                                                    all_d.remove(window_n)
+                                                    if pruned_all_d is None:
+                                                        pruned_all_d = all_d[:]
+                                                        pruned_export_mods = dict(export_mods)
+                                                    pruned_export_mods.pop(window_n, None)
+                                                    pruned_all_d.remove(window_n)
+                                    if pruned_all_d is not None:
+                                        all_d = pruned_all_d
+                                        export_mods = pruned_export_mods
 
                                 # Skip this one as it's the same as selected already
                                 try_hash = reset_sum
@@ -501,7 +604,7 @@ class Plan:
                                     try_charge_limit[window_n] = self.reserve if freeze else self.soc_max
                                 try_export = best_export_limits_reset.copy()
                                 for window_n, freeze in export_mods.items():
-                                    try_export[window_n] = 99.0 if freeze else min_freeze_percent
+                                    try_export[window_n] = EXPORT_LIMIT_FREEZE if freeze else min_freeze_percent
 
                                 pred_item = {}
                                 pred_item["handle"] = self.launch_run_prediction_single(try_charge_limit, charge_window, export_window, try_export, PV_SCENARIO_NOMINAL, end_record=end_record, step=step)
@@ -648,49 +751,36 @@ class Plan:
         )
 
     def launch_run_prediction_single(self, charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step=PREDICT_STEP):
+        """Queue a prediction and return a handle to its result.
+
+        Nothing runs here: the inputs are read when the batch is flushed, so no list or window dict
+        passed in may be mutated until the returned handle's get() has been called.
         """
-        Launch a thread to run a prediction
-        """
-        charge_limit = list(charge_limit)
-        export_limits = list(export_limits)
-        if self.pool and self.pool._state == "RUN":
-            han = self.pool.apply_async(wrapped_run_prediction_single, (charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step))
-        else:
-            han = DummyThread(self.prediction.thread_run_prediction_single(charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step))
-        return han
+        return self.prediction.queue_run_prediction_single(charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, step)
 
     def launch_run_prediction_charge(self, loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Queue a prediction and return a handle to its result.
+
+        Nothing runs here: the inputs are read when the batch is flushed, so no list or window dict
+        passed in may be mutated until the returned handle's get() has been called.
         """
-        Launch a thread to run a prediction
-        """
-        if self.pool and self.pool._state == "RUN":
-            han = self.pool.apply_async(wrapped_run_prediction_charge, (loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record))
-        else:
-            han = DummyThread(self.prediction.thread_run_prediction_charge(loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record))
-        return han
+        return self.prediction.queue_run_prediction_charge(loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record)
 
     def launch_run_prediction_charge_min_max(self, loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record):
+        """Queue a prediction and return a handle to its result.
+
+        Nothing runs here: the inputs are read when the batch is flushed, so no list or window dict
+        passed in may be mutated until the returned handle's get() has been called.
         """
-        Launch a thread to run a prediction
-        """
-        if self.pool and self.pool._state == "RUN":
-            han = self.pool.apply_async(wrapped_run_prediction_charge_min_max, (loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record))
-        else:
-            han = DummyThread(self.prediction.thread_run_prediction_charge_min_max(loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record))
-        return han
+        return self.prediction.queue_run_prediction_charge_min_max(loop_soc, window_n, charge_limit, charge_window, export_window, export_limits, pv_scenario, all_n, end_record)
 
     def launch_run_prediction_export(self, this_export_limit, start, window_n, try_charge_limit, charge_window, try_export_window, try_export, pv_scenario, all_n, end_record):
+        """Queue a prediction and return a handle to its result.
+
+        Nothing runs here: the inputs are read when the batch is flushed, so no list or window dict
+        passed in may be mutated until the returned handle's get() has been called.
         """
-        Launch a thread to run a prediction
-        """
-        if self.pool and self.pool._state == "RUN":
-            han = self.pool.apply_async(
-                wrapped_run_prediction_export,
-                (this_export_limit, start, window_n, try_charge_limit, charge_window, try_export_window, try_export, pv_scenario, all_n, end_record),
-            )
-        else:
-            han = DummyThread(self.prediction.thread_run_prediction_export(this_export_limit, start, window_n, try_charge_limit, charge_window, try_export_window, try_export, pv_scenario, all_n, end_record))
-        return han
+        return self.prediction.queue_run_prediction_export(this_export_limit, start, window_n, try_charge_limit, charge_window, try_export_window, try_export, pv_scenario, all_n, end_record)
 
     def scenario_summary_title(self, record_time):
         txt = ""
@@ -748,7 +838,7 @@ class Plan:
             export_window_n = -1
             for try_minute in range(this_minute_absolute, minute_absolute + self.plan_interval_minutes, 5):
                 export_window_n = self.in_charge_window(self.export_window_best, try_minute)
-                if export_window_n >= 0 and self.export_limits_best[export_window_n] == 100.0:
+                if export_window_n >= 0 and self.export_limits_best[export_window_n] == EXPORT_LIMIT_IDLE:
                     export_window_n = -1
                 if export_window_n >= 0:
                     break
@@ -769,7 +859,7 @@ class Plan:
             elif export_window_n >= 0:
                 export_target = self.export_limits_best[export_window_n]
                 if export_target >= soc_percent_max:
-                    if export_target == 99:
+                    if export_target == EXPORT_LIMIT_FREEZE:
                         value = "FrzExp"
                     else:
                         value = "HldExp"
@@ -976,7 +1066,7 @@ class Plan:
         """
         intervals = []
         for window, limit in zip(export_window, export_limits):
-            if limit < 99:
+            if limit < EXPORT_LIMIT_FREEZE:
                 intervals.append((window["start"], window["end"], "export"))
         for window, limit in zip(charge_window, charge_limit):
             if limit > self.reserve:
@@ -1013,7 +1103,7 @@ class Plan:
         """Copy the single window an optimisation pass can modify, so the change can be undone."""
         if typ == "c":
             return self.charge_limit_best[window_n]
-        return self.export_limits_best[window_n], copy.deepcopy(self.export_window_best[window_n])
+        return self.export_limits_best[window_n], self.export_window_best[window_n].copy()
 
     def plan_window_restore(self, typ, window_n, snapshot):
         """Put a window back as it was when plan_window_snapshot() captured it."""
@@ -1182,10 +1272,10 @@ class Plan:
         if recompute:
             # Obtain previous plan data for comparison
             if self.plan_valid:
-                charge_limit_best_prev = copy.deepcopy(self.charge_limit_best)
-                charge_window_best_prev = copy.deepcopy(self.charge_window_best)
-                export_window_best_prev = copy.deepcopy(self.export_window_best)
-                export_limits_best_prev = copy.deepcopy(self.export_limits_best)
+                charge_limit_best_prev = self.charge_limit_best.copy()
+                charge_window_best_prev = clone_windows(self.charge_window_best)
+                export_window_best_prev = clone_windows(self.export_window_best)
+                export_limits_best_prev = self.export_limits_best.copy()
                 preclip_prev = self.plan_preclip
                 self.log("Recompute is saving previous plan...")
             else:
@@ -1201,22 +1291,22 @@ class Plan:
             # Calculate best charge windows
             if self.low_rates and self.calculate_best_charge and self.set_charge_window:
                 # If we are using calculated windows directly then save them
-                self.charge_window_best = copy.deepcopy(self.low_rates)
+                self.charge_window_best = clone_windows(self.low_rates)
             else:
                 # Default best charge window as this one
-                self.charge_window_best = copy.deepcopy(self.charge_window)
+                self.charge_window_best = clone_windows(self.charge_window)
 
             # Calculate best export windows
             if self.calculate_best_export and self.set_export_window:
-                self.export_window_best = copy.deepcopy(self.high_export_rates)
+                self.export_window_best = clone_windows(self.high_export_rates)
             else:
-                self.export_window_best = copy.deepcopy(self.export_window)
+                self.export_window_best = clone_windows(self.export_window)
 
             # Pre-fill best charge limit with the current charge limit
             self.charge_limit_best = [self.current_charge_limit * self.soc_max / 100.0 for i in range(len(self.charge_window_best))]
 
             # Pre-fill best export enable with Off
-            self.export_limits_best = [100.0 for i in range(len(self.export_window_best))]
+            self.export_limits_best = [EXPORT_LIMIT_IDLE for i in range(len(self.export_window_best))]
 
             self.end_record = self.forecast_minutes
         # Show best windows
@@ -1313,35 +1403,19 @@ class Plan:
 
         # Creation prediction object
         self.prediction = Prediction(self, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, pv_forecast_minute90_step, load_minutes_step90)
+        # The kernel spreads one batched fan-out across threads with the GIL released for the whole
+        # call, so these are real cores - unlike a Python ThreadPool, which peaked at 1.15x on two
+        # threads and then degraded below serial (perf/threadpool-prototype).
+        self.prediction.batch_threads = resolve_batch_threads(self.get_arg("threads", "auto"), cpu_count())
+        self.log("Prediction batch using {} kernel thread(s)".format(self.prediction.batch_threads))
         kernel_message, kernel_is_warning = kernel_status_summary(self.prediction)
         self.log("{}Prediction kernel: {}".format("Warn: " if kernel_is_warning else "", kernel_message))
 
-        # Check if LoadML is active and disable thread pools as it causes lockup due to race conditions with NumPy
+        # Check if LoadML is active - it used to force the process pool off, which no longer exists;
+        # the kernel's threads are C++ threads with no fork and no NumPy involvement
         load_ml_comp = self.components.get_component("load_ml") if self.components else None
-        load_ml_calculating = False
         if load_ml_comp:
-            load_ml_calculating = load_ml_comp.is_calculating()
-            self.log("LoadML is_calculating {}".format(load_ml_calculating))
-            if load_ml_calculating and self.pool:
-                self.log("Disabling thread pool as LoadML is calculating to avoid lockups")
-                self.pool.close()
-                self.pool.join()
-                self.pool = None
-
-        # Create pool
-        if not self.pool:
-            if load_ml_calculating:
-                self.log("Not using thread pool as LoadML is calculating to avoid lockups")
-            else:
-                threads = self.get_arg("threads", "auto")
-                if threads == "auto":
-                    self.log("Creating pool of {} processes to match your CPU count".format(cpu_count()))
-                    self.pool = Pool(processes=cpu_count())
-                elif threads:
-                    self.log("Creating pool of {} processes as per apps.yaml".format(int(threads)))
-                    self.pool = Pool(processes=int(threads))
-                else:
-                    self.log("Not using threading as threads is set to 0 in apps.yaml")
+            self.log("LoadML is_calculating {}".format(load_ml_comp.is_calculating()))
 
         # Simulate current settings to get initial data
         metric, import_kwh_battery, import_kwh_house, export_kwh, soc_min, soc, soc_min_minute, battery_cycle, metric_keep, final_iboost, final_carbon_g = self.run_prediction(
@@ -1367,7 +1441,7 @@ class Plan:
             self.charge_limit_best, self.charge_window_best = remove_intersecting_windows(self.charge_limit_best, self.charge_window_best, self.export_limits_best, self.export_window_best)
 
             # Snapshot the plan as optimised, before clipping adjusts the percentages for execution
-            preclip_new = (copy.deepcopy(self.charge_limit_best), copy.deepcopy(self.charge_window_best), copy.deepcopy(self.export_window_best), copy.deepcopy(self.export_limits_best))
+            preclip_new = (self.charge_limit_best.copy(), clone_windows(self.charge_window_best), clone_windows(self.export_window_best), self.export_limits_best.copy())
 
             # Model-based clipping: drop slots that do nothing in the central forecast. Runs after the
             # scoring snapshot so plan selection still compares plans as optimised (#4403).
@@ -1474,10 +1548,10 @@ class Plan:
                 fragmentation_new = self.plan_fragmentation(score_new[1], score_new[0], score_new[2], score_new[3])
                 if not self.should_replace_plan(metric_prev, metric, fragmentation_prev, fragmentation_new):
                     self.log("New plan metric is not significantly better (metric_min_improvement_plan {}) than previous plan, using previous plan".format(self.metric_min_improvement_plan))
-                    self.charge_window_best = copy.deepcopy(charge_window_best_prev)
-                    self.charge_limit_best = copy.deepcopy(charge_limit_best_prev)
-                    self.export_window_best = copy.deepcopy(export_window_best_prev)
-                    self.export_limits_best = copy.deepcopy(export_limits_best_prev)
+                    self.charge_window_best = clone_windows(charge_window_best_prev)
+                    self.charge_limit_best = charge_limit_best_prev.copy()
+                    self.export_window_best = clone_windows(export_window_best_prev)
+                    self.export_limits_best = export_limits_best_prev.copy()
                     # Keeping the incumbent keeps its pre-clip snapshot too, so the next cycle still compares
                     # like for like
                     preclip_new = preclip_prev
@@ -1595,16 +1669,6 @@ class Plan:
                 for line in text_lines:
                     self.log(line)
                 self.publish_html_plan(pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)
-
-        # Destroy pool
-        if self.pool:
-            try:
-                self.pool.close()
-                self.pool.join()
-            except Exception as e:
-                self.log("Warn: failed to close thread pool: {}".format(e))
-                self.log("Warn: " + traceback.format_exc())
-            self.pool = None
 
         # Record planning duration for SLO metrics
         self.plan_last_duration_seconds = time.time() - plan_start_time
@@ -2096,9 +2160,14 @@ class Plan:
         best_cycle = 0
         best_import = 0
         best_carbon = 0
-        this_export_limit = 100.0
+        this_export_limit = EXPORT_LIMIT_IDLE
         window = export_window[window_n]
-        try_export_window = copy.deepcopy(export_window)
+        # A shallow copy is enough: nothing here writes to a window dict, and the one write that does
+        # happen downstream - the trial start - is applied copy-on-write by _prepare_export, which
+        # takes its own list and replaces that single window with dict(window, start=start). The list
+        # is still copied so a caller cannot reorder it underneath a batch that has not flushed yet.
+        # Deep-copying every window dict on entry was the largest block of copying in a plan.
+        try_export_window = list(export_window)
         try_export = list(export_limit)
         best_start = window["start"]
         best_size = window["end"] - best_start
@@ -2110,14 +2179,14 @@ class Plan:
 
         # loop on each export option
         if allow_freeze and (freeze_only or self.set_export_freeze_only):
-            loop_options = [100.0, 99.0]
+            loop_options = [EXPORT_LIMIT_IDLE, EXPORT_LIMIT_FREEZE]
         elif allow_freeze and not self.set_export_freeze_only:
             # If we support freeze, try a 99% option which will freeze at any SoC level below this
-            loop_options = [100.0, 99.0, 0.0]
+            loop_options = [EXPORT_LIMIT_IDLE, EXPORT_LIMIT_FREEZE, 0.0]
             if self.set_export_low_power:
                 loop_options.extend([0.3, 0.5, 0.7])
         else:
-            loop_options = [100.0, 0.0]
+            loop_options = [EXPORT_LIMIT_IDLE, 0.0]
             if self.set_export_low_power:
                 loop_options.extend([0.3, 0.5, 0.7])
 
@@ -2151,7 +2220,7 @@ class Plan:
                     continue
 
                 # Don't optimise start of disabled windows or freeze only windows, just for export ones
-                if (this_export_limit in [100.0, 99.0]) and (start != window["start"]):
+                if (this_export_limit in [EXPORT_LIMIT_IDLE, EXPORT_LIMIT_FREEZE]) and (start != window["start"]):
                     continue
 
                 # Never go below the minimum level
@@ -2208,7 +2277,7 @@ class Plan:
             # caller checking whether the plan actually improved has to compare on this instead
             metric_plan = metric
 
-            if this_export_limit == 100.0:
+            if this_export_limit == EXPORT_LIMIT_IDLE:
                 # Minor weighting to off
                 metric -= 0.002
             elif this_export_limit == 0:
@@ -2217,7 +2286,7 @@ class Plan:
 
             # Adjust to try to keep existing windows
             keep_export = False
-            if window_n < 2 and this_export_limit < 99.0 and self.export_window and self.isExporting:
+            if window_n < 2 and this_export_limit < EXPORT_LIMIT_FREEZE and self.export_window and self.isExporting:
                 pwindow = export_window[window_n]
                 dwindow = self.export_window[0]
                 if self.minutes_now >= pwindow["start"] and self.minutes_now < pwindow["end"] and ((self.minutes_now >= dwindow["start"] and self.minutes_now < dwindow["end"]) or (dwindow["end"] == pwindow["start"])):
@@ -2267,7 +2336,7 @@ class Plan:
             # Scale back in the case of freeze export as improvements will be smaller
             rate_scale = 1 - (this_export_limit - int(this_export_limit))
 
-            if this_export_limit == 99:
+            if this_export_limit == EXPORT_LIMIT_FREEZE:
                 min_improvement_scaled = self.metric_min_improvement_export_freeze
             elif all_n:
                 min_improvement_scaled = self.metric_min_improvement_export * rate_scale * len(all_n)
@@ -2356,9 +2425,49 @@ class Plan:
         """
         Sort windows in start time order, return a new list of windows
         """
-        window_sorted = copy.deepcopy(windows)
+        window_sorted = clone_windows(windows)
         window_sorted.sort(key=self.window_sort_func_start)
         return window_sorted
+
+    def _io_run_starts(self, windows):
+        """
+        Map each io_adjusted (Octopus Intelligent) window start to the start minute of its
+        contiguous IOG run.
+
+        A run is a maximal sequence of io_adjusted windows that are contiguous in time
+        (each window's start equal to the previous window's end). A firm window or a time
+        gap breaks the run. Firm windows are not included in the result. Input windows may
+        arrive in any order.
+        """
+        io_windows = sorted((w for w in windows if self.io_adjusted.get(w["start"], False)), key=lambda w: w["start"])
+        run_starts = {}
+        run_start = None
+        prev_end = None
+        for window in io_windows:
+            start = window["start"]
+            if run_start is None or start != prev_end:
+                run_start = start
+            run_starts[start] = run_start
+            prev_end = window["end"]
+        return run_starts
+
+    def _io_rate_adjustment(self, window_start, run_start):
+        """
+        Return the signed rate adjustment (pence) for an io_adjusted window.
+
+        Earliest slots in the run are discounted (negative) so they rank below equally-priced
+        firm slots and are filled first; latest slots are penalised (positive) so distant IOG
+        slots are not relied upon. The discount is only applied to imminent slots (starting
+        within IO_ADJUST_DISCOUNT_HORIZON_HOURS of now); the penalty side always applies.
+        """
+        hours_in = (window_start - run_start) / 60.0
+        hours_ahead = max(window_start - self.minutes_now, 0) / 60.0
+        gradient = (hours_in - IO_ADJUST_PIVOT_HOURS) * IO_ADJUST_SLOPE
+        gradient = max(-IO_ADJUST_MAX_DISCOUNT, min(IO_ADJUST_MAX_PENALTY, gradient))
+        if hours_ahead > IO_ADJUST_DISCOUNT_HORIZON_HOURS:
+            # Distant period: suppress the discount but keep any penalty
+            gradient = max(gradient, 0.0)
+        return gradient
 
     def sort_window_by_price_combined(self, charge_windows, export_windows, calculate_import_low_export=False, calculate_export_high_import=False):
         """
@@ -2372,6 +2481,7 @@ class Plan:
         pv_forecast_minute_step = self.prediction.pv_forecast_minute_step
 
         # Add charge windows
+        charge_io_run_starts = self._io_run_starts(charge_windows)
         if self.calculate_best_charge:
             id = 0
             for window in charge_windows:
@@ -2380,10 +2490,9 @@ class Plan:
                 if self.carbon_enable:
                     carbon_intensity = self.carbon_intensity.get(max(window["start"] - self.minutes_now, 0), 0)
                     average += dp1(carbon_intensity * self.carbon_metric / 1000.0)
-                is_adjusted = self.io_adjusted.get(window["start"], False)
-                if is_adjusted:
-                    # The risk that IOG adjusted slots will disappear means we should penalise them based on how far in the future they are
-                    average += min((max(window["start"] - self.minutes_now, 0) // 60), 10)
+                if window["start"] in charge_io_run_starts:
+                    # IOG (planned-dispatch) slot: apply the earlier-charge skew gradient
+                    average += self._io_rate_adjustment(window["start"], charge_io_run_starts[window["start"]])
                 average += self.metric_self_sufficiency
                 average = dp2(average)  # Round to nearest 0.01 penny to avoid too many bands
                 if calculate_import_low_export:
@@ -2417,6 +2526,7 @@ class Plan:
                 id += 1
 
         # Add export windows
+        export_io_run_starts = self._io_run_starts(export_windows)
         if self.calculate_best_export:
             id = 0
             for window in export_windows:
@@ -2428,10 +2538,9 @@ class Plan:
                 average = dp1(average)  # Round to nearest 0.01 penny to avoid too many bands
                 if calculate_export_high_import:
                     average_import = dp2((self.rate_import.get(window["start"], 0) + self.rate_import.get(window["end"] - PREDICT_STEP, 0)) / 2)
-                    is_adjusted = self.io_adjusted.get(window["start"], False)
-                    if is_adjusted:
-                        # The risk that IOG adjusted slots will disappear means we should penalise them based on how far in the future they are
-                        average_import += min((max(window["start"] - self.minutes_now, 0) // 60), 10)
+                    if window["start"] in export_io_run_starts:
+                        # IOG (planned-dispatch) slot on the import side: apply the earlier-charge skew gradient
+                        average_import += self._io_rate_adjustment(window["start"], export_io_run_starts[window["start"]])
                 else:
                     average_import = 0
                 window_start = window["start"]
@@ -2518,7 +2627,7 @@ class Plan:
         """
         Sort the charge windows by highest price first, return a list of window IDs
         """
-        window_with_id = copy.deepcopy(windows)
+        window_with_id = clone_windows(windows)
         wid = 0
         for window in window_with_id:
             window["id"] = wid
@@ -2679,10 +2788,10 @@ class Plan:
         start_metric = None
         pruned = 0
         trials = 0
-        for typ, windows, limits, off_value in (("export", self.export_window_best, self.export_limits_best, 100.0), ("charge", self.charge_window_best, self.charge_limit_best, 0)):
+        for typ, windows, limits, off_value in (("export", self.export_window_best, self.export_limits_best, EXPORT_LIMIT_IDLE), ("charge", self.charge_window_best, self.charge_limit_best, 0)):
             for window_n, window in enumerate(windows):
                 limit = limits[window_n]
-                active = (limit < 100.0) if typ == "export" else (limit > 0)
+                active = (limit < EXPORT_LIMIT_IDLE) if typ == "export" else (limit > 0)
                 if not active:
                     continue
                 if window["end"] <= self.minutes_now or window["start"] >= record_limit:
@@ -2800,7 +2909,7 @@ class Plan:
             window_length = window_end - window_start
             window["target"] = limit
 
-            if limit == 100:
+            if limit == EXPORT_LIMIT_IDLE:
                 # Ignore disabled windows
                 pass
             elif window_length > 0:
@@ -2826,7 +2935,7 @@ class Plan:
                     # no-SoC-above-reserve (#4171/#4434), phantom export (#4453/#4487) and target-unreachable.
                     # That includes the window covering the current minute, so a dead slot is never left
                     # commanding the inverter.
-                    if limit != 99.0 and soc_min > limit_soc:
+                    if limit != EXPORT_LIMIT_FREEZE and soc_min > limit_soc:
                         # Give it 10 minute margin
                         target_soc = max(limit_soc, soc_min)
                         limit_soc = max(limit_soc, soc_min - 10 * self.battery_rate_max_discharge * self.battery_rate_max_scaling_discharge)
@@ -2836,7 +2945,7 @@ class Plan:
                             self.log("Clip up export window {} from {} - {} from limit {} to new limit {} target set to {}".format(window_n, window_start, window_end, limit, export_limits_best[window_n], window["target"]))
             else:
                 self.log("Warn: Clip export window {} as it's already passed".format(window_n))
-                export_limits_best[window_n] = 100.0
+                export_limits_best[window_n] = EXPORT_LIMIT_IDLE
         return export_window_best, export_limits_best
 
     def discard_unused_export_slots(self, export_limits_best, export_window_best):
@@ -2846,7 +2955,7 @@ class Plan:
         new_best = []
         new_enable = []
         for window_n in range(len(export_limits_best)):
-            if export_limits_best[window_n] < 100.0:
+            if export_limits_best[window_n] < EXPORT_LIMIT_IDLE:
                 # Also merge contiguous enabled windows
                 if (
                     new_best
@@ -2860,7 +2969,7 @@ class Plan:
                     if self.debug_enable:
                         self.log("Combine export slot {} with previous - percent {} slot {}".format(window_n, new_enable[-1], new_best[-1]))
                 else:
-                    new_best.append(copy.deepcopy(export_window_best[window_n]))
+                    new_best.append(export_window_best[window_n].copy())
                     new_enable.append(export_limits_best[window_n])
 
         return new_enable, new_best
@@ -2874,19 +2983,30 @@ class Plan:
         for window_n in range(len(self.charge_limit_best)):
             self.charge_window_best[window_n]["target"] = self.charge_limit_best[window_n]
 
-    def tweak_plan(self, end_record):
-        """
-        Tweak existing plan only
+    def optimise_plan_pass(self, end_record, budget=0, debug_mode=False):
+        """Re-optimise each charge and export window of the settled plan, in time order.
 
-        The metric is measured from the plan we were handed rather than taken from the caller: optimise_swap_export
-        runs immediately before this and mutates the plan without its return value being used, so the caller's
-        metric is already stale. Each window change below is then only kept when it improves on that baseline.
+        This is the pass that runs after the levels and detailed passes have chosen the plan's shape.
+        Each window is re-optimised against the whole plan and the change is kept only when it improves
+        on the plan we were handed, so the pass is monotonic.
+
+        budget caps how many windows are visited; 0 visits every window in the record. The cheap default
+        exists because the near-term windows are the ones about to be executed, but the cap is what makes
+        the fast path miss value further out - see calculate_second_pass, which runs unbudgeted.
+
+        The metric is measured from the plan in hand rather than accepted from the caller, so it cannot
+        be handed a stale one - passes ahead of this can mutate the plan without their return value being
+        threaded through, and the swap passes that follow re-baseline for the same reason.
+
+        Each export window's start is reset to start_orig before it is re-optimised. Without that reset a
+        window trimmed by an earlier pass can only ever be trimmed further, so the pass cannot recover a
+        window it narrowed on a plan that has since changed underneath it.
         """
         record_charge_windows = max(self.max_charge_windows(end_record + self.minutes_now, self.charge_window_best), 1)
         record_export_windows = max(self.max_charge_windows(end_record + self.minutes_now, self.export_window_best), 1)
         selected = self.plan_metric_now(end_record)
         curr = self.currency_symbols[1]
-        self.log("Tweak plan optimisation started metric {}{}, cost {}{}".format(dp2(selected[0]), curr, dp2(selected[1]), curr))
+        self.log("Plan pass optimisation started metric {}{}, cost {}{}, budget {}".format(dp2(selected[0]), curr, dp2(selected[1]), curr, budget if budget else "unlimited"))
         count = 0
         window_sorted, window_index = self.sort_window_by_time_combined(self.charge_window_best[:record_charge_windows], self.export_window_best[:record_export_windows])
         for key in window_sorted:
@@ -2915,7 +3035,7 @@ class Plan:
                     continue
 
                 snapshot = self.plan_window_snapshot(typ, window_n)
-                self.export_window_best[window_n]["start"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
+                set_window_start(self.export_window_best[window_n], self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"]))
                 best_soc, best_start, best_metric, best_cost, soc_min, soc_min_minute, best_keep, best_cycle, best_carbon, best_import, best_metric_plan = self.optimise_export(
                     window_n,
                     record_export_windows,
@@ -2927,19 +3047,23 @@ class Plan:
                 )
                 self.export_limits_best[window_n] = best_soc
                 self.export_window_best[window_n]["start_orig"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
-                self.export_window_best[window_n]["start"] = best_start
+                set_window_start(self.export_window_best[window_n], best_start)
                 candidate = (best_metric_plan, best_cost, best_keep, best_cycle, best_carbon, best_import)
                 selected = self.keep_window_change_if_improved(selected, candidate, typ, window_n, snapshot)
+            if (count % 16) == 0 and self.debug_enable:
+                log_metric, log_cost, log_keep, log_cycle, log_carbon, log_import = selected
+                self.log("Plan pass type {} window {} metric {} metric_keep {} carbon {} import {} cost {}".format(typ, window_n, log_metric, dp2(log_keep), dp0(log_carbon), dp2(log_import), dp2(log_cost)))
             count += 1
-            if count >= 8:
+            if budget and count >= budget:
                 break
 
         best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = selected
         self.log(
-            "Tweak optimisation finished metric {}{}, cost {}{}, metric_keep {}kWh, cycle {}kWh, carbon {}kg, import {}kWh, changed {} window(s)".format(
+            "Plan pass optimisation finished metric {}{}, cost {}{}, metric_keep {}kWh, cycle {}kWh, carbon {}kg, import {}kWh, visited {} window(s)".format(
                 dp2(best_metric), curr, dp2(best_cost), curr, dp2(best_keep), dp2(best_cycle), dp0(best_carbon), dp2(best_import), count
             )
         )
+        self.plan_write_debug(debug_mode, "plan_pass.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, end_record)
         return best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import
 
     def plan_write_debug(self, debug_mode, name, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, end_record, test=False, prediction=None):
@@ -2947,8 +3071,8 @@ class Plan:
         Write debug plan to file
         """
         if debug_mode:
-            orig_charge_limit_best = copy.deepcopy(self.charge_limit_best)
-            orig_charge_window_best = copy.deepcopy(self.charge_window_best)
+            orig_charge_limit_best = self.charge_limit_best.copy()
+            orig_charge_window_best = clone_windows(self.charge_window_best)
             self.charge_limit_best, self.charge_window_best = remove_intersecting_windows(self.charge_limit_best, self.charge_window_best, self.export_limits_best, self.export_window_best)
 
             (
@@ -3033,8 +3157,8 @@ class Plan:
         for day in days:
             # Snapshot the current plan so we can revert this day if it costs too much. The window
             # list is snapshotted too as re-optimising force exports can move window start times.
-            orig_export_limits_best = copy.deepcopy(self.export_limits_best)
-            orig_export_window_best = copy.deepcopy(self.export_window_best)
+            orig_export_limits_best = self.export_limits_best.copy()
+            orig_export_window_best = clone_windows(self.export_window_best)
 
             day_start = day * (24 * 60)
             day_end = day_start + (24 * 60)
@@ -3065,14 +3189,14 @@ class Plan:
 
                 # An existing freeze export slot may have been trimmed earlier (start moved later) -
                 # restore it to its original full size so it covers the whole solar period
-                if self.export_limits_best[window_n] == 99.0:
+                if self.export_limits_best[window_n] == EXPORT_LIMIT_FREEZE:
                     start_orig = self.export_window_best[window_n].get("start_orig", window_start)
                     if start_orig < window_start:
-                        self.export_window_best[window_n]["start"] = start_orig
+                        set_window_start(self.export_window_best[window_n], start_orig)
                     continue
 
                 # Only enable currently idle (disabled) export windows
-                if self.export_limits_best[window_n] != 100.0:
+                if self.export_limits_best[window_n] != EXPORT_LIMIT_IDLE:
                     continue
 
                 # Don't freeze export where a charge is already planned - we can't charge the battery
@@ -3093,7 +3217,7 @@ class Plan:
                 if pv_period < 0.01:
                     continue
 
-                self.export_limits_best[window_n] = 99.0
+                self.export_limits_best[window_n] = EXPORT_LIMIT_FREEZE
                 added += 1
 
             if not added:
@@ -3112,7 +3236,7 @@ class Plan:
                     continue
                 if window_start in self.manual_all_times:
                     continue
-                if self.export_limits_best[window_n] >= 99.0:
+                if self.export_limits_best[window_n] >= EXPORT_LIMIT_FREEZE:
                     continue
                 if window_start <= first_solar_minute:
                     continue
@@ -3124,7 +3248,7 @@ class Plan:
                 )
                 self.export_limits_best[window_n] = new_soc
                 self.export_window_best[window_n]["start_orig"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
-                self.export_window_best[window_n]["start"] = new_start
+                set_window_start(self.export_window_best[window_n], new_start)
                 re_optimised += 1
 
             # Simulate the final plan for this day on top of any days already kept and decide on the
@@ -3154,6 +3278,7 @@ class Plan:
         """
         swapped_target = {}
         curr = self.currency_symbols[1]
+        first = True
 
         if self.calculate_best_export and record_export_windows >= 2:
             swapped = True
@@ -3161,9 +3286,13 @@ class Plan:
                 selected_metric, selected_battery_value, selected_cost, selected_keep, selected_cycle, selected_carbon, selected_import, select_export = self.run_prediction_metric(
                     self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, end_record=self.end_record
                 )
-                self.log(
-                    "Swap export optimisation started metric {}{}, cost {}{}, battery_value {}kWh, min_improvement_swap {}{}".format(dp2(selected_metric), curr, dp2(selected_cost), curr, dp2(selected_battery_value), self.metric_min_improvement_swap, curr)
-                )
+                if first:
+                    self.log(
+                        "Swap export optimisation started metric {}{}, cost {}{}, battery_value {}kWh, min_improvement_swap {}{}".format(
+                            dp2(selected_metric), curr, dp2(selected_cost), curr, dp2(selected_battery_value), self.metric_min_improvement_swap, curr
+                        )
+                    )
+                first = False
                 swapped = False
 
                 for window_n_target in range(record_export_windows - 1, 0, -1):
@@ -3188,8 +3317,8 @@ class Plan:
                         continue
 
                     # Try to drop the target
-                    if drop and export_limit_target < 100:
-                        self.export_limits_best[window_n_target] = 100.0
+                    if drop and export_limit_target < EXPORT_LIMIT_IDLE:
+                        self.export_limits_best[window_n_target] = EXPORT_LIMIT_IDLE
                         best_metric_drop, best_battery_value_drop, best_cost_drop, best_keep_drop, best_cycle_drop, best_carbon_drop, best_import_drop, best_export_drop = self.run_prediction_metric(
                             self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, end_record=self.end_record
                         )
@@ -3219,7 +3348,7 @@ class Plan:
                             selected_carbon = best_carbon_drop
                             selected_import = best_import_drop
                             swapped = True
-                            export_limit_target = 100.0
+                            export_limit_target = EXPORT_LIMIT_IDLE
                         else:
                             self.export_limits_best[window_n_target] = export_limit_target
 
@@ -3258,40 +3387,40 @@ class Plan:
                             # Don't swap if the windows are the same
                             continue
 
-                        if export_limit < 99 and window_length <= orig_length_target:
+                        if export_limit < EXPORT_LIMIT_FREEZE and window_length <= orig_length_target:
                             # Don't optimise a charge window that hits an export window if this is disallowed
                             if not self.allow_this_export_window(window_n_target):
                                 continue
 
                             is_combined = False
-                            if export_limit_target < 99 and (window_length_target + window_length) <= orig_length_target:
+                            if export_limit_target < EXPORT_LIMIT_FREEZE and (window_length_target + window_length) <= orig_length_target:
                                 # Full combine
-                                self.export_limits_best[window_n] = 100
-                                self.export_window_best[window_n]["start"] = window_start_orig
+                                self.export_limits_best[window_n] = EXPORT_LIMIT_IDLE
+                                set_window_start(self.export_window_best[window_n], window_start_orig)
                                 self.export_limits_best[window_n_target] = export_limit
-                                self.export_window_best[window_n_target]["start"] = self.export_window_best[window_n_target]["end"] - (window_length + window_length_target)
+                                set_window_start(self.export_window_best[window_n_target], self.export_window_best[window_n_target]["end"] - (window_length + window_length_target))
                                 is_combined = True
-                            elif export_limit_target < 99 and window_length_target < orig_length_target:
+                            elif export_limit_target < EXPORT_LIMIT_FREEZE and window_length_target < orig_length_target:
                                 # Partial combine
                                 amount_to_move = min(orig_length_target - window_length_target, window_length)
                                 window_length_target_new = amount_to_move + window_length_target
                                 window_length_new = amount_to_move + window_length
                                 self.export_limits_best[window_n] = min(export_limit, export_limit_target)
-                                self.export_window_best[window_n]["start"] = self.export_window_best[window_n]["end"] - window_length_new
-                                self.export_window_best[window_n_target]["start"] = self.export_window_best[window_n_target]["end"] - window_length_target_new
+                                set_window_start(self.export_window_best[window_n], self.export_window_best[window_n]["end"] - window_length_new)
+                                set_window_start(self.export_window_best[window_n_target], self.export_window_best[window_n_target]["end"] - window_length_target_new)
                                 self.export_limits_best[window_n_target] = min(export_limit, export_limit_target)
                                 is_combined = True
                             else:
                                 # Swap
-                                if export_limit_target < 100 and window_length < window_length_target:
+                                if export_limit_target < EXPORT_LIMIT_IDLE and window_length < window_length_target:
                                     # Don't swap if we move a smaller window later
                                     continue
 
                                 # Set the current window to off and optimise the swap window
                                 self.export_limits_best[window_n] = export_limit_target
-                                self.export_window_best[window_n]["start"] = max(self.export_window_best[window_n]["end"] - window_length_target, previous_end)
+                                set_window_start(self.export_window_best[window_n], max(self.export_window_best[window_n]["end"] - window_length_target, previous_end))
                                 self.export_limits_best[window_n_target] = export_limit
-                                self.export_window_best[window_n_target]["start"] = max(self.export_window_best[window_n_target]["end"] - window_length, previous_end_target)
+                                set_window_start(self.export_window_best[window_n_target], max(self.export_window_best[window_n_target]["end"] - window_length, previous_end_target))
 
                             best_metric, best_battery_value, best_cost, best_keep, best_cycle, best_carbon, best_import, best_export = self.run_prediction_metric(
                                 self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, end_record=self.end_record
@@ -3323,7 +3452,7 @@ class Plan:
                                     )
                                 )
 
-                            if ((selected_metric - best_metric) >= self.metric_min_improvement_swap) and (best_metric <= selected_metric or ((export_limit_target == 100.0 or is_combined))):
+                            if ((selected_metric - best_metric) >= self.metric_min_improvement_swap) and (best_metric <= selected_metric or ((export_limit_target == EXPORT_LIMIT_IDLE or is_combined))):
                                 if self.debug_enable:
                                     self.log(
                                         "Swap export window {} {}-{} limit {} with {} => {}-{} metric {}{}, selected_metric {}{}, min_improvement_swap {}, cost {}{}, keep {}kWh, cycle {}kWh, carbon {}kg, import {}kWh".format(
@@ -3362,9 +3491,9 @@ class Plan:
                             else:
                                 # Revert the change
                                 self.export_limits_best[window_n] = export_limit
-                                self.export_window_best[window_n]["start"] = window_start
+                                set_window_start(self.export_window_best[window_n], window_start)
                                 self.export_limits_best[window_n_target] = export_limit_target
-                                self.export_window_best[window_n_target]["start"] = window_start_target
+                                set_window_start(self.export_window_best[window_n_target], window_start_target)
 
             self.log(
                 "Swap export optimisation finished metric {}{}, cost {}{}, metric_keep {}kWh, cycle {}kWh, carbon {}kg, import {}kWh".format(
@@ -3402,12 +3531,15 @@ class Plan:
 
         swapped_target = {}
         swapped = True
+        first = True
         while swapped:
             selected_metric, selected_battery_value, selected_cost, selected_keep, selected_cycle, selected_carbon, selected_import, selected_export = self.run_prediction_metric(
                 self.charge_limit_best, self.charge_window_best, self.export_window_best, self.export_limits_best, end_record=self.end_record
             )
-            self.log("Swap charge optimisation started metric {}{}, cost {}{}, min_improvement_swap {}{}".format(dp2(selected_metric), curr, dp2(selected_cost), curr, min_improvement_swap, curr))
+            if first:
+                self.log("Swap charge optimisation started metric {}{}, cost {}{}, min_improvement_swap {}{}".format(dp2(selected_metric), curr, dp2(selected_cost), curr, min_improvement_swap, curr))
             swapped = False
+            first = False
 
             for window_n_target in range(record_charge_windows - 1, 0, -1):
                 window_start_target = self.charge_window_best[window_n_target]["start"]
@@ -3479,7 +3611,7 @@ class Plan:
         if self.calculate_best_charge and (window_start not in self.manual_all_times):
             if not self.calculate_export_oncharge:
                 hit_export = self.hit_charge_window(self.export_window_best, self.charge_window_best[charge_window_n]["start"], self.charge_window_best[charge_window_n]["end"])
-                if hit_export >= 0 and self.export_limits_best[hit_export] < 100:
+                if hit_export >= 0 and self.export_limits_best[hit_export] < EXPORT_LIMIT_IDLE:
                     return False
             return True
         return False
@@ -3502,66 +3634,6 @@ class Plan:
                 return False
             return True
         return False
-
-    def optimise_full_second_pass(self, best_metric, best_cost, best_keep, best_soc_min, best_cycle, best_carbon, best_import, best_battery_value, record_charge_windows, record_export_windows, debug_mode=False):
-        """
-        Second pass optimisation of the charge and export windows
-        """
-        self.log("Second pass optimisation started")
-
-        # Baseline the plan we were handed, for the same reason as tweak_plan: optimise_swap_export has already
-        # mutated it since the caller's metric was measured.
-        selected = self.plan_metric_now(self.end_record)
-
-        count = 0
-        window_sorted, window_index = self.sort_window_by_time_combined(self.charge_window_best[:record_charge_windows], self.export_window_best[:record_export_windows])
-        for key in window_sorted:
-            typ = window_index[key]["type"]
-            window_n = window_index[key]["id"]
-            if typ == "c":
-                if self.allow_this_charge_window(window_n):
-                    snapshot = self.plan_window_snapshot(typ, window_n)
-                    best_soc, best_metric, best_cost, soc_min, soc_min_minute, best_keep, best_cycle, best_carbon, best_import, best_metric_plan = self.optimise_charge_limit(
-                        window_n,
-                        record_charge_windows,
-                        self.charge_limit_best,
-                        self.charge_window_best,
-                        self.export_window_best,
-                        self.export_limits_best,
-                        end_record=self.end_record,
-                    )
-                    self.charge_limit_best[window_n] = best_soc
-                    candidate = (best_metric_plan, best_cost, best_keep, best_cycle, best_carbon, best_import)
-                    selected = self.keep_window_change_if_improved(selected, candidate, typ, window_n, snapshot)
-            elif typ == "d":
-                if self.allow_this_export_window(window_n):
-                    snapshot = self.plan_window_snapshot(typ, window_n)
-                    best_soc, best_start, best_metric, best_cost, soc_min, soc_min_minute, best_keep, best_cycle, best_carbon, best_import, best_metric_plan = self.optimise_export(
-                        window_n,
-                        record_export_windows,
-                        self.charge_limit_best,
-                        self.charge_window_best,
-                        self.export_window_best,
-                        self.export_limits_best,
-                        end_record=self.end_record,
-                    )
-                    self.export_limits_best[window_n] = best_soc
-                    self.export_window_best[window_n]["start_orig"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
-                    self.export_window_best[window_n]["start"] = best_start
-                    candidate = (best_metric_plan, best_cost, best_keep, best_cycle, best_carbon, best_import)
-                    selected = self.keep_window_change_if_improved(selected, candidate, typ, window_n, snapshot)
-            if (count % 16) == 0:
-                log_metric, log_cost, log_keep, log_cycle, log_carbon, log_import = selected
-                self.log("Final optimisation type {} window {} metric {} metric_keep {} best_carbon {} best_import {} cost {}".format(typ, window_n, log_metric, dp2(log_keep), dp0(log_carbon), dp2(log_import), dp2(log_cost)))
-            count += 1
-
-        # best_battery_value and best_soc_min stay as the caller passed them in, as they did before this pass
-        # measured its own metric
-        best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = selected
-        self.log("Second pass optimisation finished metric {} cost {} metric_keep {} cycle {} carbon {} import {}".format(best_metric, dp2(best_cost), dp2(best_keep), dp2(best_cycle), dp0(best_carbon), dp2(best_import)))
-
-        self.plan_write_debug(debug_mode, "plan_pass2.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
-        return best_metric, best_cost, best_keep, best_soc_min, best_cycle, best_carbon, best_import, best_battery_value
 
     def optimise_detailed_pass(
         self,
@@ -3784,7 +3856,7 @@ class Plan:
                             continue
 
                         # Don't trim a window that is already off
-                        if pass_type in ["trim_export"] and (self.export_limits_best[window_n] == 100):
+                        if pass_type in ["trim_export"] and (self.export_limits_best[window_n] == EXPORT_LIMIT_IDLE):
                             continue
 
                         # In normal don't do trimming of export
@@ -3793,15 +3865,15 @@ class Plan:
 
                         # Do highest price first
                         # Second pass to tune down any excess exports only
-                        if pass_type == "low" and (self.export_limits_best[window_n] == 100):
+                        if pass_type == "low" and (self.export_limits_best[window_n] == EXPORT_LIMIT_IDLE):
                             continue
 
                         # Don't trim freeze, that can be done in the freeze pass
-                        if pass_type == "trim_export" and self.export_limits_best[window_n] == 99:
+                        if pass_type == "trim_export" and self.export_limits_best[window_n] == EXPORT_LIMIT_FREEZE:
                             continue
 
                         # Ignore prices below the threshold if not already selected during levelling
-                        if (price_key < best_price_export_level) and (self.export_limits_best[window_n] == 100):
+                        if (price_key < best_price_export_level) and (self.export_limits_best[window_n] == EXPORT_LIMIT_IDLE):
                             if self.debug_enable:
                                 self.log("Skip low window {} best limit {} price_set {} price {} level {}".format(window_n, self.export_limits_best[window_n], price_key, price, best_price_export_level))
                             continue
@@ -3839,7 +3911,7 @@ class Plan:
                                 )
                             # Try to optimise the export window
                             keep_start = self.export_window_best[window_n]["start"]
-                            self.export_window_best[window_n]["start"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
+                            set_window_start(self.export_window_best[window_n], self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"]))
                             n_best_soc, n_best_start, n_best_metric, n_best_cost, n_soc_min, n_soc_min_minute, n_best_keep, n_best_cycle, n_best_carbon, n_best_import, n_best_metric_plan = self.optimise_export(
                                 window_n,
                                 record_export_windows,
@@ -3851,14 +3923,14 @@ class Plan:
                                 freeze_only=(typ == "df") or pass_type == "freeze",
                                 allow_freeze=True,
                             )
-                            self.export_window_best[window_n]["start"] = keep_start
+                            set_window_start(self.export_window_best[window_n], keep_start)
                             # The export trim pass may only reduce export, never add it, so the cheapest slots
                             # shed any levels over-export before the high-priced peak is touched. A reduction is
                             # a shallower discharge (higher SoC limit) and/or a smaller window (later start) -
                             # never a deeper discharge nor an earlier start (a bigger window exports more, even
                             # when the SoC limit rises). Off/freeze (limit >= 99) export no battery and force the
                             # start back to the full window, so they are exempt from the earlier-start check.
-                            trim_export_ok = pass_type != "trim_export" or (n_best_soc >= self.export_limits_best[window_n] and (n_best_soc >= 99 or n_best_start >= keep_start))
+                            trim_export_ok = pass_type != "trim_export" or (n_best_soc >= self.export_limits_best[window_n] and (n_best_soc >= EXPORT_LIMIT_FREEZE or n_best_start >= keep_start))
                             if n_best_metric < best_metric and (n_best_soc != self.export_limits_best[window_n] or n_best_start != self.export_window_best[window_n]["start"]) and trim_export_ok:
                                 # Only a strict improvement drives another refinement iteration (see
                                 # the charge block above for why equal-metric flips must not).
@@ -3875,7 +3947,7 @@ class Plan:
                                 best_soc_min_minute = n_soc_min_minute
                                 self.export_limits_best[window_n] = best_soc
                                 self.export_window_best[window_n]["start_orig"] = self.export_window_best[window_n].get("start_orig", self.export_window_best[window_n]["start"])
-                                self.export_window_best[window_n]["start"] = best_start
+                                set_window_start(self.export_window_best[window_n], best_start)
 
                                 self.plan_write_debug(debug_mode, "plan_{}_export_{}.html".format(pass_type, window_n), self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
 
@@ -4126,26 +4198,22 @@ class Plan:
             record_export_windows,
             debug_mode=debug_mode,
         )
-        # Swaps
-        self.optimise_swap_export(record_charge_windows, record_export_windows, debug_mode=debug_mode)
-        self.plan_write_debug(debug_mode, "plan_swap_final.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
-
-        # Second pass optimisation
-        if self.calculate_second_pass:
-            # Full second pass (slower)
-            best_metric, best_cost, best_keep, best_soc_min, best_cycle, best_carbon, best_import, best_battery_value = self.optimise_full_second_pass(
-                best_metric, best_cost, best_keep, best_soc_min, best_cycle, best_carbon, best_import, best_battery_value, record_charge_windows, record_export_windows, debug_mode=debug_mode
-            )
-        else:
-            # Tweak plan (faster)
-            best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = self.tweak_plan(self.end_record)
+        # Re-optimise each window of the settled plan. calculate_second_pass lifts the window budget so
+        # every window in the record is revisited rather than just the near-term ones (slower).
+        best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = self.optimise_plan_pass(self.end_record, budget=0 if self.calculate_second_pass else PLAN_PASS_WINDOW_BUDGET, debug_mode=debug_mode)
 
         # Export more solar - enable freeze export on idle solar windows if it doesn't cost too much
         if self.export_more_solar:
             best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import = self.optimise_solar(best_metric, best_cost, best_keep, best_cycle, best_carbon, best_import, record_export_windows, debug_mode=debug_mode)
 
-        # Charge swap runs last, once all other passes have settled, so a strictly-improving pairwise
-        # charge move is not subsequently undone by a non-monotonic pass (tweak/second/solar).
+        # Swaps run once all other passes have settled. The export swap can only defer an export that
+        # already exists when it runs, and the plan pass and solar pass both turn exports on - on the
+        # budgeted plan pass the windows it reaches are the near-term ones, so the exports it adds are at
+        # the front, exactly the ones the swap exists to push back. Running the swap before them left
+        # those pinned in place (#4478). The charge swap follows for the mirror-image reason: a
+        # strictly-improving pairwise charge move must not be subsequently undone by a non-monotonic pass.
+        self.optimise_swap_export(record_charge_windows, record_export_windows, debug_mode=debug_mode)
+        self.plan_write_debug(debug_mode, "plan_swap_final.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
         self.optimise_swap_charge(record_charge_windows, debug_mode=debug_mode)
 
         self.plan_write_debug(debug_mode, "plan_raw.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
@@ -4173,11 +4241,11 @@ class Plan:
         if self.export_window_best and self.calculate_best_export:
             for window_n in range(len(self.export_window_best)):
                 if self.export_window_best[window_n]["start"] in self.manual_demand_times:
-                    self.export_limits_best[window_n] = 100.0
+                    self.export_limits_best[window_n] = EXPORT_LIMIT_IDLE
                 elif self.export_window_best[window_n]["start"] in self.manual_export_times:
                     self.export_limits_best[window_n] = 0.0
                 elif self.export_window_best[window_n]["start"] in self.manual_freeze_export_times:
-                    self.export_limits_best[window_n] = 99.0
+                    self.export_limits_best[window_n] = EXPORT_LIMIT_FREEZE
 
     def optimise_charge_windows_reset(self, reset_all):
         """
@@ -4203,9 +4271,9 @@ class Plan:
             for window_n in range(len(self.export_window_best)):
                 if self.export_window_best[window_n]["start"] < (self.minutes_now + self.end_record):
                     if reset_all:
-                        self.export_limits_best[window_n] = 100.0
+                        self.export_limits_best[window_n] = EXPORT_LIMIT_IDLE
                 else:
-                    self.export_limits_best[window_n] = 100.0
+                    self.export_limits_best[window_n] = EXPORT_LIMIT_IDLE
 
     def run_prediction(self, charge_limit, charge_window, export_window, export_limits, pv_scenario, end_record, save=None, step=PREDICT_STEP):
         """
@@ -4557,6 +4625,7 @@ class Plan:
                         "friendly_name": "Predicted Battery Power Best",
                         "state_class": "measurement",
                         "unit_of_measurement": "kW",
+                        "device_class": "power",
                         "icon": "mdi:battery",
                     },
                 )
@@ -4581,6 +4650,7 @@ class Plan:
                         "friendly_name": "Predicted PV Power Best",
                         "state_class": "measurement",
                         "unit_of_measurement": "kW",
+                        "device_class": "power",
                         "icon": "mdi:battery",
                     },
                 )
@@ -4593,6 +4663,7 @@ class Plan:
                         "friendly_name": "Predicted Grid Power Best",
                         "state_class": "measurement",
                         "unit_of_measurement": "kW",
+                        "device_class": "power",
                         "icon": "mdi:battery",
                     },
                 )
@@ -4605,6 +4676,7 @@ class Plan:
                         "friendly_name": "Predicted Load Power Best",
                         "state_class": "measurement",
                         "unit_of_measurement": "kW",
+                        "device_class": "power",
                         "icon": "mdi:battery",
                     },
                 )
@@ -5185,16 +5257,69 @@ class Plan:
             car_charging_kwh = dp2(car_charging_kwh)
         return car_charging_kwh
 
-    def hit_car_window(self, window_start, window_end):
+    def car_charge_slot_rate(self, minute_start, minute_end):
         """
-        Does this window intersect a car charging window?
+        Work out the car's own effective import rate (p/kWh) for the given
+        self.plan_interval_minutes-minute slot - the kWh-weighted average across any
+        car_charging_slots windows active in it. This can differ from the general household
+        import rate once a car's IOG dispatch cap is exhausted for the day (batpred#4646).
+        Returns None if no car charging in this slot.
         """
+        total_kwh = 0.0
+        total_cost = 0.0
         if self.num_cars > 0:
             for car_n in range(self.num_cars):
                 for window in self.car_charging_slots[car_n]:
+                    if "average" not in window:
+                        # Non-Octopus historical reconstruction (Yesterday view) appends slots from
+                        # the car's own energy sensor with no rate at all - treating that as 0p/kWh
+                        # would drag the weighted average down and falsely flag ordinary charging as
+                        # diverging from the house rate. Skip rather than guess.
+                        continue
                     start = window["start"]
                     end = window["end"]
-                    kwh = dp2(window["kwh"])
-                    if end > window_start and start < window_end and kwh > 0:
-                        return True
-        return False
+                    if start < minute_end and end > minute_start and end != start:
+                        overlap_start = max(start, minute_start)
+                        overlap_end = min(end, minute_end)
+                        kwh = dp2(window["kwh"]) * (overlap_end - overlap_start) / (end - start)
+                        total_kwh += kwh
+                        total_cost += kwh * window["average"]
+        if total_kwh > 0.0001:
+            return dp2(total_cost / total_kwh)
+        return None
+
+    def hit_car_window(self, window_start, window_end, cache=None):
+        """Does this window intersect a car charging window?
+
+        cache, when given, is a caller-owned dict of (start, end) -> hit. The optimiser asks the same
+        question about the same handful of windows millions of times per plan, so the caller keeps a dict
+        for as long as car_charging_slots cannot change underneath it and the scan collapses to a lookup.
+        Deliberately not held on self: the lifetime then belongs to whoever knows when the slots change.
+
+        The slot scan tests the intersection before dp2(): rounding every slot's kwh up front made this the
+        most expensive function in planning for anyone with an EV, since the rounding was being done for
+        nearly every slot the overlap test then discarded (6.45us -> 1.08us per call at 48 slots). dp2 is
+        pure, so testing it last cannot change the answer.
+        """
+        if self.num_cars <= 0:
+            # No car, no cache work - this is the common case and it has to stay a single test
+            return False
+
+        key = (window_start, window_end)
+        if cache is not None:
+            hit = cache.get(key)
+            if hit is not None:
+                return hit
+
+        hit = False
+        for car_n in range(self.num_cars):
+            for window in self.car_charging_slots[car_n]:
+                if window["end"] > window_start and window["start"] < window_end and dp2(window["kwh"]) > 0:
+                    hit = True
+                    break
+            if hit:
+                break
+
+        if cache is not None:
+            cache[key] = hit
+        return hit

@@ -17,7 +17,28 @@ from utils import calc_percent_limit
 from tests.test_infra import TestHAInterface
 from predbat import PredBat
 from const import MINUTE_WATT, INVERTER_MAX_RETRY_REST
-from inverter import Inverter
+from inverter import Inverter, DISCHARGE_TARGET_UNSUPPORTED_MODELS
+from config import INVERTER_DEF
+
+
+def test_foxess_support_discharge_freeze_matches_foxcloud():
+    """
+    FoxESS (modbus) and FoxCloud are the same hardware via two different connection methods - "feed-in
+    first"/freeze export does not hold SoC flat on either, PV above the export limit still charges the
+    battery instead of being clipped (#4207). Both are now True: that spillover-charges-the-battery
+    behaviour is correctly modelled (prediction.py's freeze branch, gated on
+    inverter_can_charge_during_export) rather than being a reason to disable freeze outright for this
+    hardware - see test_freeze_export_recapture_beyond_limit in test_optimise_solar.py for the modelling
+    itself.
+    """
+    failed = False
+    if INVERTER_DEF["FoxESS"]["support_discharge_freeze"] is not True:
+        print("ERROR: FoxESS support_discharge_freeze should be True, got {}".format(INVERTER_DEF["FoxESS"]["support_discharge_freeze"]))
+        failed = True
+    if INVERTER_DEF["FoxESS"]["support_discharge_freeze"] != INVERTER_DEF["FoxCloud"]["support_discharge_freeze"]:
+        print("ERROR: FoxESS support_discharge_freeze ({}) should match FoxCloud ({}) - same hardware, different connection method".format(INVERTER_DEF["FoxESS"]["support_discharge_freeze"], INVERTER_DEF["FoxCloud"]["support_discharge_freeze"]))
+        failed = True
+    return failed
 
 
 def dummy_sleep(seconds):
@@ -455,6 +476,51 @@ def test_adjust_charge_rate(test_name, ha, inv, dummy_rest, prev_rate, rate, exp
         expect_data = []
     if json.dumps(expect_data) != json.dumps(rest_command):
         print("ERROR: Rest command should be {} got {}".format(expect_data, rest_command))
+        failed = True
+
+    return failed
+
+
+def test_current_reasserted_on_unchanged_rate(test_name, ha, inv, prev_current, rate, discharge=False):
+    """
+    Test that timed_charge_current / timed_discharge_current is re-asserted on every call to
+    adjust_charge_rate()/adjust_discharge_rate(), even when the rate itself is unchanged between
+    calls - regression test for #4415. The register can be reset externally (observed on Solis
+    GS_fb00); before this fix the write was only attempted when the rate itself changed, so an
+    external reset between rate changes was never corrected.
+    """
+    failed = False
+    inv.rest_data = None
+    inv.rest_api = None
+    inv.inv_output_charge_control = "current"
+    inv.battery_voltage = 50.0
+    inv.inv_current_dp = 1
+
+    entity = "number.timed_discharge_current" if discharge else "number.timed_charge_current"
+    expect_current = round(rate / inv.battery_voltage, 1)
+
+    # First call establishes the rate and writes the current register correctly
+    if discharge:
+        inv.adjust_discharge_rate(rate)
+    else:
+        inv.adjust_charge_rate(rate)
+
+    if ha.get_state(entity) != expect_current:
+        print("ERROR: {} expected initial current {} got {}".format(test_name, expect_current, ha.get_state(entity)))
+        failed = True
+
+    # Simulate something external (firmware reset, etc.) resetting the register between cycles
+    ha.dummy_items[entity] = prev_current
+
+    # Second call with the SAME rate - before the fix this would be a no-op, since the write was
+    # gated behind "did the rate change" rather than the current register's own live state
+    if discharge:
+        inv.adjust_discharge_rate(rate)
+    else:
+        inv.adjust_charge_rate(rate)
+
+    if ha.get_state(entity) != expect_current:
+        print("ERROR: {} expected current re-asserted to {} after external reset, got {}".format(test_name, expect_current, ha.get_state(entity)))
         failed = True
 
     return failed
@@ -1242,10 +1308,15 @@ def test_call_adjust_export_immediate(test_name, my_predbat, ha, inv, dummy_item
     else:
         my_predbat.args["discharge_freeze_service"] = None
     my_predbat.args["device_id"] = "DID0"
-    power = int(inv.battery_rate_max_discharge * MINUTE_WATT)
+    my_predbat.args["discharge_rate"] = "number.discharge_rate"
+    if "discharge_rate_percent" in my_predbat.args:
+        del my_predbat.args["discharge_rate_percent"]
 
     dummy_items["select.discharge_start_time"] = discharge_start_time
     dummy_items["select.discharge_end_time"] = discharge_end_time
+    dummy_items["number.discharge_rate"] = 1802
+
+    power = 1802
 
     inv.adjust_export_immediate(soc, freeze=freeze)
     result = ha.get_service_store()
@@ -1483,6 +1554,175 @@ def test_charge_window_none_value(test_name, my_predbat, dummy_items):
         print(f"ERROR: {test_name} - track_charge_end should be '00:00:00', got {inv.track_charge_end}")
         failed = True
 
+    return failed
+
+
+def test_charge_window_no_source_configured(test_name, my_predbat, dummy_items):
+    """
+    Test charge window handling when neither a REST API (givtcp_rest) nor a charge_start_time/
+    charge_end_time config source is configured at all (issue #4179 / PR #4288 review). This is a
+    permanent setup gap, not a transient one, so update_status() should raise a clear, informative
+    ValueError (unlike the original bare `raise ValueError` with no message) rather than silently
+    retrying forever on a config gap that will never close itself - maintainer call on #4288.
+    """
+    failed = False
+    print(f"**** Running Test: {test_name} ****")
+
+    inv = Inverter(my_predbat, 0)
+    inv.sleep = dummy_sleep
+    inv.inv_has_charge_enable_time = True
+    inv.rest_api = None
+    inv.rest_data = None
+
+    # Remove charge_start_time/charge_end_time from config entirely, so neither the REST nor the
+    # config-arg branch can produce a value
+    original_charge_start_time = my_predbat.args.pop("charge_start_time", None)
+    original_charge_end_time = my_predbat.args.pop("charge_end_time", None)
+    dummy_items["switch.scheduled_charge_enable"] = "on"
+
+    try:
+        inv.update_status(my_predbat.minutes_now)
+        print(f"ERROR: {test_name} - update_status should raise ValueError when no charge window source is configured at all")
+        failed = True
+    except ValueError as e:
+        if "no source is configured" not in str(e):
+            print(f"ERROR: {test_name} - ValueError message should explain the cause, got: {e}")
+            failed = True
+        if "Error: Inverter" not in my_predbat.current_status:
+            print(f"ERROR: {test_name} - current_status should reflect the error, got: {my_predbat.current_status}")
+            failed = True
+    finally:
+        # Restore config so this doesn't affect later tests
+        if original_charge_start_time is not None:
+            my_predbat.args["charge_start_time"] = original_charge_start_time
+        if original_charge_end_time is not None:
+            my_predbat.args["charge_end_time"] = original_charge_end_time
+
+    return failed
+
+
+def test_charge_window_rest_configured_but_no_data_yet(test_name, my_predbat, dummy_items):
+    """
+    Test charge window handling when a REST API (givtcp_rest) *is* configured but rest_data hasn't
+    successfully returned anything yet this cycle (issue #4179's actual production trigger -
+    GivEnergy cloud "no devices" or a fresh start before the first poll). Unlike the "nothing
+    configured at all" case above, this is genuinely transient - the data source is legitimate, it
+    just hasn't produced a value yet - so it should fall through to the same safe-defaults/
+    retry-next-update handling as a configured-but-currently-unusable value, not raise.
+    """
+    failed = False
+    print(f"**** Running Test: {test_name} ****")
+
+    inv = Inverter(my_predbat, 0)
+    inv.sleep = dummy_sleep
+    inv.inv_has_charge_enable_time = True
+    inv.rest_api = "http://givtcp:6345"
+    inv.rest_data = None
+
+    original_charge_start_time = my_predbat.args.pop("charge_start_time", None)
+    original_charge_end_time = my_predbat.args.pop("charge_end_time", None)
+    dummy_items["switch.scheduled_charge_enable"] = "on"
+
+    try:
+        inv.update_status(my_predbat.minutes_now)
+    except ValueError as e:
+        print(f"ERROR: {test_name} - update_status should not raise while a configured REST source just hasn't returned data yet, got ValueError({e})")
+        failed = True
+        if original_charge_start_time is not None:
+            my_predbat.args["charge_start_time"] = original_charge_start_time
+        if original_charge_end_time is not None:
+            my_predbat.args["charge_end_time"] = original_charge_end_time
+        return failed
+
+    # Should set the same safe defaults as the "value is None" case
+    if inv.charge_enable_time != False:
+        print(f"ERROR: {test_name} - charge_enable_time should be False, got {inv.charge_enable_time}")
+        failed = True
+    if inv.charge_start_time_minutes != my_predbat.forecast_minutes:
+        print(f"ERROR: {test_name} - charge_start_time_minutes should be {my_predbat.forecast_minutes}, got {inv.charge_start_time_minutes}")
+        failed = True
+    if inv.charge_end_time_minutes != my_predbat.forecast_minutes:
+        print(f"ERROR: {test_name} - charge_end_time_minutes should be {my_predbat.forecast_minutes}, got {inv.charge_end_time_minutes}")
+        failed = True
+    if inv.track_charge_start != "00:00:00":
+        print(f"ERROR: {test_name} - track_charge_start should be '00:00:00', got {inv.track_charge_start}")
+        failed = True
+    if inv.track_charge_end != "00:00:00":
+        print(f"ERROR: {test_name} - track_charge_end should be '00:00:00', got {inv.track_charge_end}")
+        failed = True
+
+    # Restore config for later tests
+    if original_charge_start_time is not None:
+        my_predbat.args["charge_start_time"] = original_charge_start_time
+    if original_charge_end_time is not None:
+        my_predbat.args["charge_end_time"] = original_charge_end_time
+
+    return failed
+
+
+def test_charge_window_ge_cloud_configured_but_no_data_yet(test_name, my_predbat, dummy_items):
+    """
+    Test charge window handling when ge_cloud_direct is configured but the cloud hasn't returned
+    usable data. This is the same transient case as the givtcp_rest test above, reached the other
+    way round: ge_cloud_direct sets neither rest_api nor charge_start_time, because it
+    auto-configures the charge window at runtime from whatever device the cloud reports. Gating the
+    transient branch solely on rest_api therefore sent every cloud-backed instance whose fetch
+    failed into the permanent-setup-gap branch and raised, killing the plan for something outside
+    the user's apps.yaml entirely - observed live as HTTP 402 on a lapsed account, "no devices
+    found" on a stale credential, and a 401 after the user revoked their API key.
+    """
+    failed = False
+    print(f"**** Running Test: {test_name} ****")
+
+    inv = Inverter(my_predbat, 0)
+    inv.sleep = dummy_sleep
+    inv.inv_has_charge_enable_time = True
+    inv.rest_api = None
+    inv.rest_data = None
+
+    original_charge_start_time = my_predbat.args.pop("charge_start_time", None)
+    original_charge_end_time = my_predbat.args.pop("charge_end_time", None)
+    original_ge_cloud_direct = my_predbat.args.get("ge_cloud_direct", None)
+    my_predbat.args["ge_cloud_direct"] = True
+    dummy_items["switch.scheduled_charge_enable"] = "on"
+
+    def restore():
+        """Restore the config this test mutated so later tests are unaffected."""
+        if original_charge_start_time is not None:
+            my_predbat.args["charge_start_time"] = original_charge_start_time
+        if original_charge_end_time is not None:
+            my_predbat.args["charge_end_time"] = original_charge_end_time
+        if original_ge_cloud_direct is None:
+            my_predbat.args.pop("ge_cloud_direct", None)
+        else:
+            my_predbat.args["ge_cloud_direct"] = original_ge_cloud_direct
+
+    try:
+        inv.update_status(my_predbat.minutes_now)
+    except ValueError as e:
+        print(f"ERROR: {test_name} - update_status should not raise while a configured GE Cloud source just hasn't returned data yet, got ValueError({e})")
+        restore()
+        return True
+
+    # Should set the same safe defaults as the REST case
+    if inv.charge_enable_time != False:
+        print(f"ERROR: {test_name} - charge_enable_time should be False, got {inv.charge_enable_time}")
+        failed = True
+    if inv.charge_start_time_minutes != my_predbat.forecast_minutes:
+        print(f"ERROR: {test_name} - charge_start_time_minutes should be {my_predbat.forecast_minutes}, got {inv.charge_start_time_minutes}")
+        failed = True
+    if inv.charge_end_time_minutes != my_predbat.forecast_minutes:
+        print(f"ERROR: {test_name} - charge_end_time_minutes should be {my_predbat.forecast_minutes}, got {inv.charge_end_time_minutes}")
+        failed = True
+
+    # The retry warning is the message a user now actually sees for this failure, so it must name
+    # GE Cloud rather than blaming apps.yaml - that misdirection is what made three separate live
+    # incidents look identical.
+    if "GE Cloud" not in my_predbat.current_status:
+        print(f"ERROR: {test_name} - status should name GE Cloud as the source that returned no data, got: {my_predbat.current_status}")
+        failed = True
+
+    restore()
     return failed
 
 
@@ -1969,6 +2209,115 @@ def test_discharge_target_control_signal(test_name, ha, inv, dummy_rest):
     return failed
 
 
+def test_discharge_target_skipped_for_ac_coupled(test_name, ha, inv, dummy_rest):
+    """
+    Regression test for issue #4517: some GivTCP inverter models (see
+    DISCHARGE_TARGET_UNSUPPORTED_MODELS) don't have a working Discharge_Target_SOC_1 register -
+    GivTCP reports a write as successful, but it never persists between cycles, so the caller sees a
+    permanent mismatch and rewrites indefinitely. "Ac" (AC Coupled) was confirmed first; "Hybrid_gen1"
+    was added after a reporter confirmed live, post-fix, that two of his Gen1 inverters still repeated
+    the write every cycle while a third, genuinely AC Coupled, correctly stopped. Skip outright rather
+    than attempting a write already known to be doomed.
+    """
+    failed = False
+    print("Test: {}".format(test_name))
+
+    saved_rest_data = inv.rest_data
+    saved_rest_api = inv.rest_api
+    saved_rest_v3 = inv.rest_v3
+
+    try:
+        inv.rest_api = "dummy"
+        inv.rest_v3 = True
+        inv.reserve_percent = 20
+
+        start_time = "03:33:00"
+        end_time = "04:44:00"
+        ts = datetime.strptime(start_time, "%H:%M:%S")
+        te = datetime.strptime(end_time, "%H:%M:%S")
+
+        inv.rest_data = {
+            "Control": {"Mode": "Timed Export", "Enable_Discharge_Schedule": "on"},
+            "Timeslots": {"Discharge_start_time_slot_1": start_time, "Discharge_end_time_slot_1": end_time},
+            "raw": {"invertor": {"discharge_target_soc_1": "4", "model": "Ac"}},
+        }
+
+        # Every model confirmed (or inferred - see the constant's own comment) unsupported must
+        # attempt no discharge-target REST commands at all.
+        for model in DISCHARGE_TARGET_UNSUPPORTED_MODELS:
+            inv.rest_data["raw"]["invertor"]["model"] = model
+            dummy_rest.clear_queue()
+            dummy_rest.rest_data = copy.deepcopy(inv.rest_data)
+            inv.adjust_force_export(True, ts, te)
+            commands = dummy_rest.get_commands()
+            if commands:
+                print("ERROR: {}: model={!r} should attempt no discharge-target REST commands, got {}".format(test_name, model, commands))
+                failed = True
+
+        # A model not on the unsupported list (including a later Hybrid generation, or no model
+        # reported at all) must still attempt the write as before.
+        for model in ["Hybrid", "Hybrid_gen3", ""]:
+            inv.rest_data["raw"]["invertor"]["model"] = model
+            dummy_rest.clear_queue()
+            dummy_rest.rest_data = copy.deepcopy(inv.rest_data)
+            inv.adjust_force_export(True, ts, te)
+            commands = dummy_rest.get_commands()
+            if not any(c[0] == "dummy/setDischargeTarget" for c in commands):
+                print("ERROR: {}: model={!r} should still attempt setDischargeTarget, got {}".format(test_name, model, commands))
+                failed = True
+    finally:
+        inv.rest_data = saved_rest_data
+        inv.rest_api = saved_rest_api
+        inv.rest_v3 = saved_rest_v3
+
+    return failed
+
+
+def test_discharge_target_read_prefers_control(test_name, ha, inv):
+    """
+    Regression test for issue #4517: a discharge target write kept firing every cycle even when
+    unchanged, because the caller that decides whether to write at all (adjust_force_export) read
+    only raw.invertor.discharge_target_soc_1 - the same slow, self_run-poll-refreshed field #4492
+    moved away from as the primary signal inside rest_setDischargeTarget() itself. On hardware where
+    that field never catches up, the caller saw a permanent mismatch and re-wrote on every cycle.
+
+    rest_readDischargeTarget() is the fix: a shared helper both the caller and (potentially)
+    rest_setDischargeTarget() can use, checking Control.Discharge_Target_SOC_1 (GivTCP's synchronous
+    write-time signal) first and falling back to raw.invertor only if Control doesn't have it.
+    """
+    failed = False
+    print("Test: {}".format(test_name))
+
+    saved_rest_data = inv.rest_data
+
+    try:
+        # Control has the real, current value - stale raw must not override it (the core of #4517:
+        # the old caller ignored Control entirely and would have seen "0", not "20", here).
+        inv.rest_data = {"Control": {"Discharge_Target_SOC_1": "20"}, "raw": {"invertor": {"discharge_target_soc_1": "0"}}}
+        result = inv.rest_readDischargeTarget()
+        if result != 20:
+            print("ERROR: {}: expected Control's value 20, got {}".format(test_name, result))
+            failed = True
+
+        # Control missing the key entirely - falls back to raw.
+        inv.rest_data = {"Control": {}, "raw": {"invertor": {"discharge_target_soc_1": "15"}}}
+        result = inv.rest_readDischargeTarget()
+        if result != 15:
+            print("ERROR: {}: expected raw fallback value 15, got {}".format(test_name, result))
+            failed = True
+
+        # Neither present - no crash, just None (matches "No current discharge target to read" path).
+        inv.rest_data = {"Control": {}, "raw": {"invertor": {}}}
+        result = inv.rest_readDischargeTarget()
+        if result is not None:
+            print("ERROR: {}: expected None when neither field is present, got {}".format(test_name, result))
+            failed = True
+    finally:
+        inv.rest_data = saved_rest_data
+
+    return failed
+
+
 def test_force_export_unchanged_times_HM_format(test_name, ha, inv):
     """
     Regression test for GS_fb00 (Solis) 'count register writes 0' bug.
@@ -2369,6 +2718,7 @@ def run_inverter_tests(my_predbat_dummy):
 
     failed = False
     print("**** Running Inverter tests ****")
+    failed |= test_foxess_support_discharge_freeze_matches_foxcloud()
     ha = my_predbat.ha_interface
 
     time_now = my_predbat.now_utc.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -2401,6 +2751,8 @@ def run_inverter_tests(my_predbat_dummy):
         "sensor.predbat_GE_0_scheduled_discharge_enable": "off",
         "number.discharge_target_soc": 4,
         "switch.inverter_button": False,
+        "number.timed_charge_current": 0.0,
+        "number.timed_discharge_current": 0.0,
     }
     my_predbat.ha_interface.dummy_items = dummy_items
     my_predbat.args["auto_restart"] = [{"service": "switch/turn_on", "entity_id": "switch.restart"}]
@@ -2724,6 +3076,13 @@ def run_inverter_tests(my_predbat_dummy):
     failed |= test_adjust_charge_rate("adjust_discharge_rate1", ha, inv, dummy_rest, 0, 250.1, 250, discharge=True)
     failed |= test_adjust_charge_rate("adjust_discharge_rate2", ha, inv, dummy_rest, 250, 0, 0, discharge=True)
     failed |= test_adjust_charge_rate("adjust_discharge_rate3", ha, inv, dummy_rest, 200, 210, 200, discharge=True)
+    if failed:
+        return failed
+
+    # #4415: timed_charge_current/timed_discharge_current must be re-asserted every call, not
+    # just when the rate itself changes
+    failed |= test_current_reasserted_on_unchanged_rate("current_reassert_charge", ha, inv, 0, 200)
+    failed |= test_current_reasserted_on_unchanged_rate("current_reassert_discharge", ha, inv, 0, 250, discharge=True)
     if failed:
         return failed
 
@@ -3103,6 +3462,18 @@ charge_start_service:
     if failed:
         return failed
 
+    failed |= test_charge_window_no_source_configured("charge_window_no_source_configured", my_predbat, dummy_items)
+    if failed:
+        return failed
+
+    failed |= test_charge_window_rest_configured_but_no_data_yet("charge_window_rest_configured_but_no_data_yet", my_predbat, dummy_items)
+    if failed:
+        return failed
+
+    failed |= test_charge_window_ge_cloud_configured_but_no_data_yet("charge_window_ge_cloud_configured_but_no_data_yet", my_predbat, dummy_items)
+    if failed:
+        return failed
+
     # Test discharge window None handling
     failed |= test_discharge_window_none_illegal_time("discharge_window_illegal_time", my_predbat, dummy_items)
     if failed:
@@ -3162,6 +3533,18 @@ charge_start_service:
     # Regression test for issue #4421 (follow-up): trust Control.Discharge_Target_SOC_1, GivTCP's
     # synchronous write-time signal, ahead of the much slower raw.invertor background-poll fallback
     failed |= test_discharge_target_control_signal("discharge_target_control_signal", ha, inv, dummy_rest)
+    if failed:
+        return failed
+
+    # Regression test for issue #4517 (follow-up): AC Coupled inverters don't have a working
+    # discharge target register, skip the write entirely rather than retrying it forever
+    failed |= test_discharge_target_skipped_for_ac_coupled("discharge_target_skipped_for_ac_coupled", ha, inv, dummy_rest)
+    if failed:
+        return failed
+
+    # Regression test for issue #4517: the caller deciding whether to write at all must also prefer
+    # Control.Discharge_Target_SOC_1 over the slow raw.invertor fallback, or it re-writes every cycle
+    failed |= test_discharge_target_read_prefers_control("discharge_target_read_prefers_control", ha, inv)
     if failed:
         return failed
 

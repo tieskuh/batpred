@@ -10,13 +10,38 @@ import io
 import yaml
 import sys
 import asyncio
+import os
+import subprocess
+
+
+def write_git_version_marker():
+    """
+    Best-effort: when running from a git checkout - directly, or via the symlinked
+    .py files that coverage/standalone_ha sets up for a live-HA dev run - record the
+    commit as git_version.txt next to this file (predbat.py resolves its own __file__
+    to the same directory) so predbat.py can show it instead of just the release tag.
+    Runs before predbat is imported, since that's when predbat.py reads the marker.
+    Silently does nothing if git isn't available or this isn't a checkout.
+    """
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_dir = os.path.dirname(os.path.realpath(__file__))
+    try:
+        commit = subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+        dirty = bool(subprocess.check_output(["git", "-C", repo_dir, "status", "--porcelain"], stderr=subprocess.DEVNULL).decode().strip())
+        with open(os.path.join(this_dir, "git_version.txt"), "w") as f:
+            f.write(commit + ("-dirty" if dirty else ""))
+    except Exception:
+        pass
+
+
+write_git_version_marker()
+
 import predbat
 import time
 from datetime import datetime, timedelta
 from multiprocessing import set_start_method
 import concurrent.futures
 import threading
-import os
 import traceback
 
 
@@ -164,9 +189,7 @@ class Hass:
         log_size = self.logfile.tell()
         if log_size > 10000000 and threading.current_thread() is threading.main_thread():
             # Only rotate from the main thread to avoid race conditions with
-            # component threads that also call log() — a Threading.Lock cannot
-            # be used here because the logfile object must survive pickle for
-            # the multiprocessing pool.
+            # component threads that also call log().
             for num_logs in range(max_logs - 1, 0, -1):
                 filename = "predbat." + format(num_logs) + ".log"
                 if os.path.isfile(filename):
