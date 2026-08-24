@@ -816,7 +816,7 @@ class Prediction(PredictionBatch):
                 # above the configured priority SoC, capped at its own solar limit (independent of the grid plan
                 # target). Modelling only - Predbat does not control the car, it only reflects the diverted energy.
                 for car_n in range(self.num_cars):
-                    if self.car_charging_solar[car_n] and self.car_charging_plugged[car_n] and pv_now > 0 and car_soc[car_n] < self.car_charging_solar_limit[car_n]:
+                    if car_n < len(self.car_charging_solar) and self.car_charging_solar[car_n] and self.car_charging_plugged[car_n] and pv_now > 0 and car_soc[car_n] < self.car_charging_solar_limit[car_n]:
                         # Home battery priority: only divert to the car once the home battery SoC is above the threshold
                         if soc_max <= 0 or (soc * 100.0 / soc_max) >= self.car_charging_solar_min_soc:
                             # Only the PV left after the house load is served is available to the car
