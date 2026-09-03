@@ -201,6 +201,8 @@ pred_bat:
   kraken_password: !secret kraken_password  # Kraken password (if using Kraken component)
 ```
 
+If a credential-like value (matching a key name containing `_key`, `password`, `secret` or `token`) is found written directly in `apps.yaml` instead of via `!secret`, Predbat logs a warning and lists the affected item(s) on the [web interface](web-interface.md) apps.yaml page. This is a warning rather than a validation error - the configuration still works, but moving the value into `secrets.yaml` keeps it out of `apps.yaml`, which is more likely to end up shared, backed up or attached to a bug report.
+
 When Predbat loads, it will automatically replace `!secret octopus_api_key` with the actual value from `secrets.yaml`.
 
 If a secret is referenced in `apps.yaml` but not found in `secrets.yaml`, Predbat will log a warning and the configuration item will be set to `None`.
@@ -410,24 +412,36 @@ there are gaps in your history or when your usage pattern has changed (for examp
 holiday), because it no longer depends on a small number of specific days all being present and
 representative.
 
-Each historical 5-minute sample is combined into a weighted average for the matching time-of-day, where the
-weight of every sample is the product of three factors:
+Each historical 5-minute sample is combined into a weighted average for the matching time-of-day. Only samples
+whose [holiday mode](customisation.md#holiday-mode) state matches that of the day being predicted are averaged
+at all - a sample recorded while you were away tells you nothing about a day you are at home, and vice versa.
+The historical holiday state is reconstructed from the recorded history of `holiday_days_left`, and is matched
+per 5-minute sample rather than per whole day, so switching holiday mode on or off mid-day is handled correctly.
+
+The weight of each matching sample is the product of two factors:
 
 - **Weekday** - 1.0 if the historical day is the same day of the week as today; 0.7 if it is a different day
-  but both are weekdays or both are weekend days; 0.5 if one is a weekday and the other a weekend day.
-- **Holiday** - reduced by 50% if that historical day's [holiday mode](customisation.md#holiday-mode) state
-  does not match today's holiday mode state. The historical holiday state is reconstructed from the recorded
-  history of `holiday_days_left`.
+  but both are weekdays or both are weekend days; 0.5 if one is a weekday and the other a weekend day. This
+  is held at 1.0 between two holiday days, as holiday load has no weekday pattern to match.
 - **Age** - 0.9 for yesterday, reducing by 0.03 per day down to a floor of 0.1 (reached after about a
   month), so recent days count for more.
+
+The holiday state is evaluated for the day each forecast slot falls on, not just for today, so the day you
+travel home is planned against your normal load even while you are still away.
+
+If a time-of-day has no matching history at all - the first 24 hours of a holiday, or a return from a holiday
+longer than the search window - Predbat falls back to the weighted average of every day, scaled by
+[**input_number.predbat_holiday_load_scaling**](customisation.md#holiday-mode) (or divided by it when you are
+back home). This is what makes holiday mode act from the moment you switch it on, rather than waiting a day
+for holiday history to accumulate.
 
 Buckets with no recorded data (zero) are ignored entirely so gaps in the history do not drag the estimate
 down. As with Load ML, this replaces the normal days_previous averaging; if [Load ML](load-ml.md) is enabled
 it takes precedence over `days_previous_auto`.
 
-Because the Holiday weighting factor above already accounts for [holiday mode](customisation.md#holiday-mode)
-when `days_previous_auto` is enabled, Predbat does not separately force days_previous to `1` while holiday
-mode is active (unlike when `days_previous_auto` is disabled).
+Because the holiday matching above already accounts for [holiday mode](customisation.md#holiday-mode) when
+`days_previous_auto` is enabled, Predbat does not separately force days_previous to `1` while holiday mode is
+active (unlike when `days_previous_auto` is disabled).
 
 Do keep in mind that Home Assistant only keeps 10 days of history by default, so if you want to access more than this for Predbat you might need to increase the number of days of history
 kept in HA before it is purged by editing and adding the following to the `/homeassistant/configuration.yaml` configuration file and restarting Home Assistant afterwards:
@@ -517,6 +531,23 @@ This setting takes priority over **ge_cloud_automatic_shared_ct** if both are se
 
 - **ge_cloud_automatic_split_pv** - Optional, defaults to false. When set to `true`, Predbat will also include any standalone PV-only inverters (e.g. a GivEnergy AC-coupled PV inverter with no battery attached) in **pv_today** and **pv_power**, in addition to the battery inverters.
 Use this if you have a separate PV-only inverter alongside your battery inverter(s) and want its solar generation included in Predbat's totals. Leave this off (the default) if your battery inverters already report all of your solar generation, to avoid duplicating or including unwanted readings.
+
+- **ge_cloud_automatic_evc** - Optional, defaults to false. When set to `true`, any GivEnergy EV charger on your account is wired into
+Predbat's car planning, so **car_charging_energy**, **car_charging_planned** and **num_cars** need no `apps.yaml` entries of your own.
+Chargers are taken in serial order, so charger N is car N, and this happens whether or not you have a GivEnergy battery.
+Everything else about your car - **car_charging_battery_size**, **car_charging_limit** and **car_charging_soc** - still comes from
+`apps.yaml` as usual.
+This is a separate setting from **ge_cloud_automatic** because it registers a car and changes **num_cars**, so turning on inverter
+auto-configuration does not silently change your car setup. The charger's own entities are published either way.
+See [Components - GivEnergy Cloud Direct](components.md#ev-chargers-gecloud) for the entities this publishes.
+
+- **ge_cloud_evc_control** - Optional, defaults to false. When set to `true`, Predbat starts and stops your GivEnergy EV charger from its
+car charging plan, in the same way it can drive a myenergi Zappi or an Ohme charger. Charger N follows car N. Needs **ge_cloud_automatic_evc**,
+since it is that setting which maps each charger to a car.
+A `switch.predbat_gecloud_evc_control` entity appears when this is set, on by default, so you can hand the charger back without editing
+`apps.yaml`; releasing sends a start command if Predbat had stopped the charger, so a car is never left unable to charge.
+Read only mode releases the chargers in the same way.
+See [Components - Charger control](components.md#charger-control-gecloud) for the details.
 
 ### SolaX Cloud Direct
 
@@ -884,7 +915,7 @@ Register a developer application at [open.alphaess.com](https://open.alphaess.co
 - `alphaess_control_enable` - Allow Predbat to write charge/export schedules to the inverter. Defaults to **`true`** - an AlphaESS component that is configured but not writing to the inverter is not what most users expect, so set this to `false` explicitly if you only want monitoring
 - `alphaess_battery_rate_max` - Optional override, in Watts, for the battery's maximum charge/discharge rate - see below
 - `alphaess_api_delay` - Optional pacing between API calls, in seconds (default: `2`). AlphaESS advise a minimum 10-second polling interval between calls to the same endpoint
-- `alphaess_min_write_interval` - Optional minimum spacing between writes to the same inverter, in seconds (default: `300`). Both write endpoints are documented as writable once per 24 hours, so this is the first line of defence against exhausting that budget
+- `alphaess_min_write_interval` - Optional minimum spacing between writes to the same inverter, in seconds (default: `300`). Both write endpoints are documented as writable once per 24 hours, so this is the first line of defence against exhausting that budget. Predbat applies a schedule in stages (window, then enable, then target SoC), so for up to 60 seconds after a write it will still send a small number of corrections to the schedule it just sent - otherwise a half-applied schedule, such as a charge window carrying the previous cycle's target SoC, would sit on the inverter for the whole interval
 
 Regardless of `alphaess_control_enable`, `switch.predbat_set_read_only` holds back Predbat's own automatic writes - **including Predbat's periodic re-apply** of a schedule it already believes is correct, not just new plan changes. It does **not** hold back a manual press of a schedule write button in Home Assistant - that matches Sunsynk's behaviour. A press is not forced, though: it applies the schedule through the same path Predbat's own cycle uses, so it sends nothing if the payload is unchanged since the last successful write, and is held until the next eligible cycle if it falls inside `alphaess_min_write_interval`. A press can therefore reach the inverter, but is not guaranteed to. If you want to be completely sure nothing is written, avoid pressing a write button while read-only is set, as well as checking the switch.
 
@@ -1256,7 +1287,9 @@ During a force export **or freeze export** period, if the generated solar exceed
 If this setting is `true` then the inverter is able to charge the battery from excess PV while still in Force Export or Freeze Export mode.
 If this setting is `false` then the inverter will not charge the battery and the excess PV will be lost.
 
-For Freeze Export specifically, this means the battery still holds its SoC flat while the export limit alone can absorb all the surplus solar - it only starts charging once solar genuinely exceeds what load and the export limit together can use, matching how many hybrid inverters actually behave (e.g. FoxESS's "Feed-in First" mode prioritises house load, then export, then the battery).
+For Freeze Export specifically, this means that during a solar surplus the battery still holds its SoC flat while the export limit alone can absorb all that surplus - it only starts charging once solar genuinely exceeds what load and the export limit together can use.
+
+Freeze Export recapture also depends on your inverter type, not just this setting. Most inverters implement Freeze Export by simply disabling charging, so PV beyond the export limit really is clipped and lost; only inverters with a genuine "Feed-in First" mode - which prioritises house load, then export, then the battery - recapture it. Today that means FoxESS and FoxCloud, plus the four cloud integrations that switch the inverter into an export-first work mode for the freeze: SolisCloud ("Feed-in priority"), SolaxCloud ("Feed-in"), SunsynkCloud and DeyeCloud (both "Selling First"). Predbat knows which is which from your inverter type and models the two differently, so setting `inverter_can_charge_during_export` to `true` will not make a non-Feed-in-First inverter charge during Freeze Export. Force Export is unaffected and is still controlled by this setting alone.
 
 ### **inverter_freeze_export_discharge_rate**
 
@@ -1264,13 +1297,15 @@ Global setting, defaults to `0` (disabled).
 
 Controls the way Predbat models your inverter, this does not change the way it is controlled.
 
-Some inverters (observed on AlphaESS) continue a small residual battery discharge during Freeze Export instead of holding the battery perfectly flat. If your inverter behaves this way, set this to the observed battery-side discharge rate in Watts so Predbat's prediction model matches reality.
+Freeze Export disables charging but leaves the inverter in Demand mode, so by default Predbat models the battery as still discharging to cover house load whenever load exceeds solar - only charging is prevented.
+
+Some inverters (observed on AlphaESS) do not behave that way: instead of covering house load they only leak a small fixed battery discharge during Freeze Export. If your inverter behaves this way, set this to the observed battery-side discharge rate in Watts so Predbat's prediction model matches reality.
 
 ```yaml
   inverter_freeze_export_discharge_rate: 269
 ```
 
-When set, Predbat feeds this rate into the normal AC balance during a Freeze Export period: house load consumes it first, and any surplus may reach the grid, subject to the battery reserve and the physical export limit. Leave this at `0` (the default) if your inverter holds the battery flat during Freeze Export.
+When set, Predbat feeds this rate into the normal AC balance during a Freeze Export period instead of the load-covering discharge: house load consumes it first, and any surplus may reach the grid, subject to the battery reserve and the physical export limit. Leave this at `0` (the default) if your inverter discharges to cover house load during Freeze Export.
 
 ## Controlling the Inverter
 
@@ -1877,6 +1912,7 @@ Details of configuring `apps.yaml` for EV charging are described in [Configure a
 - **car_charging_exclusive** for multiple EV's to indicate if they can be charged independently or not
 - **car_energy_reported_load** - Set to False if your EV charger is wired outside the inverter's CT clamp (see [car charging documentation](car-charging.md#filtering-car-charging-energy-from-house-load))
 - **car_charging_energy** - Energy consumed by your EV charger
+- **car_charging_power** - Live power drawn by your EV charger, used for display only
 - **octopus_intelligent_slot** - Octopus Energy integration 'intelligent dispatching' sensor that indicates
 whether you are within an Octopus Energy "smart charge" slot
 - **octopus_ready_time** - Octopus Energy integration sensor for when the car charging will be completed by
@@ -1914,10 +1950,15 @@ The direct transport (the default) needs your hub serial number and an API key y
   myenergi_api_key: !secret myenergi_api_key
 ```
 
+The hub serial is the login for the direct API - it is sent as the HTTP digest username, with the API key as the password -
+and not a filter naming which device to read, so there is no 'all devices' value and it cannot be left out. One serial is all
+you need: Predbat asks for every device on the account in a single call and publishes each Zappi and Eddi it finds. If you have
+no hub, use the serial of the device acting as one, which is the Zappi or Eddi the API key was generated against.
+
 **Configuration options:**
 
 - **myenergi_auth_method** - `direct` (default, local digest API) or `oauth` (official cloud API)
-- **myenergi_hub_serial** - Hub serial number, printed on the hub and shown in the myenergi app - required when `myenergi_auth_method` is `direct`
+- **myenergi_hub_serial** - Hub serial number, printed on the hub and shown in the myenergi app - required when `myenergi_auth_method` is `direct`, and the serial of your Zappi or Eddi if you have no hub
 - **myenergi_api_key** - API key generated at [myaccount.myenergi.com](https://myaccount.myenergi.com) (Advanced → API Key) - required when `myenergi_auth_method` is `direct`
 - **myenergi_key** - OAuth access token, cloud transport
 - **myenergi_token_hash** - OAuth refresh token hash, used to refresh `myenergi_key` automatically - at least one of `myenergi_key` or `myenergi_token_hash` is required when `myenergi_auth_method` is `oauth`
@@ -1930,6 +1971,143 @@ The direct transport (the default) needs your hub serial number and an API key y
 The component only starts when at least one of `myenergi_api_key`, `myenergi_key` or `myenergi_token_hash` is set. That test is a plain any-of and does not look at `myenergi_auth_method`, so a credential belonging to the transport you did not select still starts the component — it then logs which setting is missing rather than failing silently.
 
 See [Components - myenergi](components.md#myenergi-myenergi) for the full list of published entities, the boost controls, and a known limitation around very short charging or diversion sessions.
+
+## AI Chat Agent
+
+Predbat can add a Chat tab to the web interface, backed by a large language model. That can be a hosted service such as [OpenRouter](https://openrouter.ai), or a model running on your own machine through [Ollama](https://ollama.com) - with a local model nothing you ask, and nothing the tools return, leaves your network.
+
+Everything the chat agent uses lives in one **chat** block. Endpoints go under **providers**, each named by you, so you can configure more than one and switch between them in the Chat tab:
+
+```yaml
+  chat:
+    providers:
+      openrouter:
+        type: openrouter
+        url: 'https://openrouter.ai/api/v1'
+        model: nvidia/nemotron-3-ultra-550b-a55b:free
+        api_key: !secret openrouter_api_key
+      ollama:
+        type: ollama
+        url: 'http://localhost:11434/v1'
+        model: gpt-oss:20b
+      ollama_cloud:
+        type: ollama
+        url: 'https://ollama.com/v1'
+        model: gpt-oss:120b
+        api_key: !secret ollama_cloud_api_key
+```
+
+That is a complete, working example with all three kinds of endpoint - a hosted aggregator, a
+server of your own, and Ollama's paid cloud - and you can delete whichever you do not want. The
+local one shows `localhost`, which is only right if Ollama runs on the same machine as Predbat;
+see [Reaching Ollama from Predbat](#reaching-ollama-from-predbat), because inside Home Assistant
+it usually does not.
+
+Every field above except **api_key** is optional. Left out, **type** is taken from the entry's
+name and **url** and **model** from the defaults below - so `openrouter:` with just a key is a
+working provider on its own.
+
+You do not have to write this block by hand. The Chat tab's **Settings** dialog adds, edits and removes providers and saves them here for you, keeping the rest of the file - including your comments - as it was; see [Chat View](web-interface.md#chat-view). It never shows you a saved API key, and leaving the key box empty when editing a provider keeps whatever is already in the file.
+
+**model** belongs to the provider rather than the block, because a model id only means anything to the endpoint serving it - `openai/gpt-4o-mini` does not exist on Ollama and `qwen3:latest` does not exist on OpenRouter.
+
+Leave it out and the provider starts on a sensible default for its kind, so a newly configured endpoint answers straight away:
+
+| Provider type | Default model |
+| ------------- | ------------- |
+| `openrouter` | `nvidia/nemotron-3-ultra-550b-a55b:free` - free, so a first question never bills you unexpectedly |
+| `ollama` | `gpt-oss:20b` |
+| `openai`, `local` | None - there is no sensible guess for an arbitrary endpoint, so pick one from the Chat tab |
+
+You can change model at any time from the Chat tab's search box, and Predbat remembers your choice per provider, so switching between them does not lose it.
+
+### Reaching Ollama from Predbat
+
+`http://localhost:11434/v1` only works when Ollama is running on the same machine as Predbat, and
+it usually is not - Predbat runs inside its Home Assistant container, so "localhost" there means
+the container, not your desktop. Two things need doing:
+
+1. **Let Ollama listen on the network.** Out of the box it only accepts connections from its own
+   machine. In the Ollama desktop app, turn on **Expose Ollama to the network** in Settings. For a
+   server or Docker install, set `OLLAMA_HOST=0.0.0.0` in its environment and restart it.
+2. **Point Predbat at the host, not at localhost.** Use the machine's name or IP address -
+   `http://192.168.1.50:11434/v1`, `http://my-desktop.local:11434/v1` - as the **url**.
+
+If the URL is wrong or Ollama is not listening, the Chat tab says so rather than failing silently:
+the model picker reports what went wrong instead of offering models, and **Fetch models** in the
+Settings dialog gives the same message while you are still typing the address. A machine that
+sleeps takes its models with it, so a desktop running Ollama needs to be awake when you ask
+Predbat something.
+
+### Ollama Cloud
+
+Ollama also runs models on its own hardware, which you reach as an ordinary provider rather than
+through your local server:
+
+```yaml
+  chat:
+    providers:
+      ollama_cloud:
+        type: ollama
+        url: 'https://ollama.com/v1'
+        model: gpt-oss:120b
+        api_key: !secret ollama_cloud_api_key
+```
+
+Two things to get right. The URL is `https://ollama.com/v1` - not `/api/v1`, which is a 404 - and
+the model ids there are plain (`gpt-oss:120b`), without the `-cloud` suffix a *local* server uses
+when it refers to a cloud model it has pulled.
+
+Unlike your own machine, this is a paid service, so Predbat treats its models as billable: the
+Chat tab's **Show only free models** box will hide all of them, and tells you how many are behind
+it. The same provider type pointed at a local address is free, because it is your own hardware -
+where Ollama runs decides which it is, not what the entry is called.
+
+A hosted endpoint needs an **api_key**; a local one needs only a **url** and no key at all. The name is yours to choose - it is what appears in the Chat tab - so you can have two of the same kind:
+
+```yaml
+  chat:
+    providers:
+      desktop:
+        type: ollama
+        url: 'http://localhost:11434/v1'
+      nas:
+        type: ollama
+        url: 'http://192.168.1.50:11434/v1'
+      work:
+        type: openai
+        url: 'https://llm.example.com/v1'
+        api_key: !secret work_llm_key
+    turn_timeout: 1800
+```
+
+Everything else the agent takes sits alongside **providers** in the same block, without the `chat_` prefix those settings used to carry.
+
+**type** is only needed when the name does not already say which kind of endpoint it is. Left out, Predbat uses the entry's name if that is a provider it knows (`openrouter`, `ollama`, `openai`), and otherwise works it out from the URL - a `localhost` or private-network address needs no key, anything else does. Set it explicitly if the guess is wrong for your setup; `local` is the generic keyless option for an OpenAI-compatible server that is not Ollama.
+
+An entry missing what it needs - a hosted endpoint with no key - still appears in the Chat tab's Settings dialog, marked as needing a key before it can answer, rather than silently vanishing.
+
+There is no separate enable switch: configuring an endpoint is what enables the feature, and the model is chosen in the Chat tab rather than here.
+
+Before enabling this, read the [chat component's security note](components.md#security-note-chat): the web interface has no login of its own, tool results (including log lines and configuration) are sent to whichever provider you have configured and on to whoever serves the model you choose, and a deleted conversation's stored copy is not removed immediately - it stays on disk until it expires.
+
+**Configuration options:**
+
+All of these live inside the **chat** block:
+
+- **providers** - The named endpoints described above. Each takes **url**, **api_key**, **type** and **model**, all optional individually but needing enough between them to reach something
+- **max_tokens** - Maximum tokens per completion; `0` leaves it to the model/provider's own default (default: `0`)
+- **max_tool_rounds** - Maximum model round trips (completions) allowed within one turn before Predbat stops and asks you to continue. Every tool call the model makes inside one round trip still runs - this bounds round trips, not tool calls (default: `32`)
+- **max_history** - Maximum recent messages sent to the model each turn, trimmed at a user-message boundary so a tool call and its reply are never split apart - bounds cost, not how much of the conversation is stored. `0` (the default) means unlimited - the whole conversation is sent every turn (default: `0`)
+- **max_conversations** - Maximum conversations kept; the least recently updated are pruned once you go over this (default: `20`)
+- **expiry_days** - Days of inactivity before a conversation's stored copy expires (default: `30`)
+- **turn_timeout** - Seconds a whole turn is allowed to run, across every round trip, before Predbat stops it (default: `1800`)
+- **request_timeout** - Seconds a single completion request is allowed to run before it is treated as hung - bounds one request, not the whole turn (default: `300`)
+- **fetch_allowlist** - Hosts the agent's `fetch_url` tool is allowed to reach, replacing rather than extending the default list (default: `springfall2008.github.io`, `github.com`, `raw.githubusercontent.com`)
+
+Three switches also control the chat agent's behaviour once it is running. **switch.predbat_chat_confirm_writes** (on) holds every configuration change or plan override the agent proposes for your approval before it runs. **switch.predbat_ai_ha_state_enable** (on) lets it read any Home Assistant entity and its history, not just Predbat's own - turn this off if you would rather the model saw only Predbat's own data. **switch.predbat_chat_web_search** (off) lets the model search the wider web through OpenRouter's plugin, which costs roughly $0.001-0.015 per request on top of the model's own cost; it is the only one of the three that costs money, which is why it is the only one off by default. Searching Predbat's own documentation does not use it and works regardless.
+
+See [Components - AI Chat Agent](components.md#ai-chat-agent-chat) for the full tool list and [the Chat tab](web-interface.md#chat-view) for how to use it.
 
 ## Watch List - automatically start Predbat execution
 

@@ -287,6 +287,7 @@ Predbat outputs the values it read from your inverters as totals, this gives the
 - predbat.battery_power - The current power of your battery (charging or discharging) in Watts
 - predbat.pv_power - The current power of your PV system in Watts
 - predbat.grid_power - The current grid power flow (import or export) in Watts
+- predbat.car_charging_power - The current power drawn by your car charger in kW. Only published when **car_charging_power** is set in `apps.yaml`, or wired up automatically by a supported charger integration (Ohme, myenergi Zappi, GivEnergy EV charger, AlphaESS or the Predbat gateway) - see [car charging](car-charging.md#configure-appsyaml-for-your-car-charging)
 
 ## Baseline data
 
@@ -488,6 +489,7 @@ The sensor state is the total AC inverter limit in kW, with the rest of the deta
 | num_inverters | Number of inverters |
 | num_cars | Number of cars Predbat is planning for |
 | inverter_can_charge_during_export | Whether the battery can be charged while the inverter is exporting |
+| inverter_support_feedin_first | Whether your inverter's Freeze Export is a genuine "Feed-in First" mode, so PV above the export limit charges the battery rather than being clipped. Set from your inverter type, not from apps.yaml, and is only true when every inverter in the fleet supports it |
 | metric_standing_charge | Daily standing charge |
 | forecast_minutes | Length of the forecast horizon in minutes |
 | plan_interval_minutes | Length of one slot in the plan in minutes |
@@ -604,6 +606,8 @@ They are used in the carbon chart - see [creating the Predbat charts](creating-c
 - predbat.carbon_best - Predicted Carbon intensity in g for your home under the best plan based on grid imports, grid exports and the grid's projected carbon intensity
 - predbat.carbon_now - A sensor that gives the current Grid Carbon intensity in g/kWh
 - predbat.carbon_today - A sensor that tracks your home's Carbon impact today in g based on your grid import minus your grid export
+- predbat.carbon_yesterday - A sensor that gives your home's total Carbon impact in g for yesterday (00:00-23:59 on the previous day)
+- predbat.carbon_total - A running total in g of the above carbon_yesterday sensor, with attribute of the total in kg. Only published when **carbon_enable** is set
 
 ## Cost saving data
 

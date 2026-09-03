@@ -10,7 +10,8 @@
 # fmt on
 
 from gecloud import GECloudDirect, GECloudData, regname_to_ha
-from gecloud import GE_API_ACCOUNT, GE_API_DEVICES, GE_API_EVC_SEND_COMMAND
+from gecloud import GE_API_ACCOUNT, GE_API_DEVICES, GE_API_EVC_SEND_COMMAND, GE_API_INVERTER_WRITE_SETTING
+from gecloud import GECloudTerminalError
 from utils import dp4
 import asyncio
 import json
@@ -50,9 +51,20 @@ class MockGECloudDirect(GECloudDirect):
         self.evc_device = {}
         self.evc_data = {}
         self.evc_sessions = {}
+        self.evc_status_unknown = set()
+        self.automatic_evc = False
+        self.evc_control = False
+        self.evc_control_active = False
+        self.evc_control_enabled = True
+        self.evc_control_released = False
+        self.evc_control_state = {}
+        self.evc_control_windows = {}
+        self.entity_states = {}
+        self.entity_attributes = {}
         self.pending_writes = {}
         self.register_entity_map = {}
         self.polling_mode = False
+        self.last_success_timestamp = None
         self.devices_dict = {}
         self.evc_devices_dict = []
         self.ems_device = None
@@ -78,6 +90,7 @@ class MockGECloudDirect(GECloudDirect):
         class MockBase:
             def __init__(self):
                 self.ha_interface = MockHAInterface()
+                self.num_cars = 0
 
         self.base = MockBase()
 
@@ -102,15 +115,17 @@ class MockGECloudDirect(GECloudDirect):
         """Mock set_arg"""
         self.config_args[name] = value
 
-    def get_state_wrapper(self, entity_id, default=None):
+    def get_state_wrapper(self, entity_id, default=None, attribute=None, **kwargs):
         """Mock get_state_wrapper"""
         if "_set_read_only" in entity_id:
             return "on" if self._read_only else "off"
-        return default
+        if attribute is not None:
+            return self.entity_attributes.get(entity_id, {}).get(attribute, default)
+        return self.entity_states.get(entity_id, default)
 
     def update_success_timestamp(self):
-        """Mock update_success_timestamp"""
-        pass
+        """Mock update_success_timestamp - records the time, as the real component does"""
+        self.last_success_timestamp = datetime.now(timezone.utc)
 
     @property
     def storage(self):
@@ -251,6 +266,11 @@ def test_ge_cloud(my_predbat=None):
         ("read_errors", _test_async_read_inverter_setting_error_codes, "Read inverter setting error codes"),
         ("write_success", _test_async_write_inverter_setting_success, "Write inverter setting success"),
         ("write_failure", _test_async_write_inverter_setting_failure, "Write inverter setting failure"),
+        ("api_locked", _test_async_get_inverter_data_inverter_locked, "Inverter locked body is a failure, not a success"),
+        ("api_body_retryable", _test_async_get_inverter_data_retryable_body_failure, "Retryable body failure returns None"),
+        ("write_locked", _test_async_write_inverter_setting_locked, "Write aborts on a terminal failure"),
+        ("api_bare_code", _test_async_get_inverter_data_terminal_code_without_success_flag, "Terminal code without a success flag is a failure"),
+        ("api_negative_value", _test_async_get_inverter_data_negative_value_other_endpoint, "Negative value outside the setting endpoints is data"),
         ("switch_event", _test_switch_event, "Switch event handler"),
         ("number_event", _test_number_event, "Number event handler"),
         ("select_event", _test_select_event, "Select event handler"),
@@ -261,6 +281,9 @@ def test_ge_cloud(my_predbat=None):
         ("publish_registers", _test_publish_registers, "Publish registers"),
         ("publish_evc_data", _test_publish_evc_data, "Publish EVC data"),
         ("automatic_config", _test_async_automatic_config, "Automatic config"),
+        ("publish_evc_device", _test_publish_evc_device, "Publish EVC device status"),
+        ("automatic_config_evc", _test_async_automatic_config_evc, "Automatic config for EV chargers"),
+        ("evc_control", _test_evc_control, "EV charger control from the car plan"),
         ("hybrid_detection", _test_hybrid_detection, "Hybrid inverter detection"),
         ("enable_defaults", _test_enable_default_options, "Enable default options"),
         ("enable_defaults_skip_target", _test_enable_default_options_skips_discharge_target, "Enable defaults skips the discharge target register"),
@@ -1847,7 +1870,7 @@ def _test_async_send_evc_command(my_predbat):
             if result != mock_success_response:
                 print("ERROR: Expected success response {}, got {}".format(mock_success_response, result))
                 return 1
-            if result["success"] != True:
+            if result["success"] is not True:
                 print("ERROR: Expected success=True in response")
                 return 1
 
@@ -2141,7 +2164,7 @@ def _test_async_get_evc_device(my_predbat):
             if result["serial_number"] != "EVC123456":
                 print(f"ERROR: Expected serial_number EVC123456, got {result['serial_number']}")
                 return 1
-            if result["online"] != True:
+            if result["online"] is not True:
                 print(f"ERROR: Expected online True, got {result['online']}")
                 return 1
             if result["status"] != "charging":
@@ -2170,7 +2193,7 @@ def _test_async_get_evc_device(my_predbat):
 
             result = await ge_cloud.async_get_evc_device(test_uuid, {})
 
-            if result["online"] != False:
+            if result["online"] is not False:
                 print(f"ERROR: Expected online False, got {result['online']}")
                 return 1
             if result["went_offline_at"] != "2025-12-24T10:30:00Z":
@@ -2655,6 +2678,9 @@ def _test_run_method(my_predbat):
         async def mock_publish_evc_data(serial, data):
             call_order.append(f"publish_evc_data:{serial}")
 
+        async def mock_publish_evc_device(serial, device):
+            call_order.append(f"publish_evc_device:{serial}")
+
         async def mock_get_inverter_settings(device, first, previous):
             call_order.append(f"async_get_inverter_settings:{device}")
             return {}
@@ -2664,6 +2690,9 @@ def _test_run_method(my_predbat):
 
         async def mock_automatic_config(devices_dict):
             call_order.append("async_automatic_config")
+
+        async def mock_automatic_config_evc():
+            call_order.append("async_automatic_config_evc")
 
         async def mock_enable_default_options(device, settings):
             call_order.append(f"enable_default_options:{device}")
@@ -2683,9 +2712,11 @@ def _test_run_method(my_predbat):
         ge_cloud.async_get_evc_device_data = mock_get_evc_device_data
         ge_cloud.async_get_evc_sessions = mock_get_evc_sessions
         ge_cloud.publish_evc_data = mock_publish_evc_data
+        ge_cloud.publish_evc_device = mock_publish_evc_device
         ge_cloud.async_get_inverter_settings = mock_get_inverter_settings
         ge_cloud.publish_registers = mock_publish_registers
         ge_cloud.async_automatic_config = mock_automatic_config
+        ge_cloud.async_automatic_config_evc = mock_automatic_config_evc
         ge_cloud.enable_default_options = mock_enable_default_options
 
         # Test first run (first=True, seconds=0)
@@ -2714,6 +2745,7 @@ def _test_run_method(my_predbat):
             "async_get_evc_device_data:evc-001",
             "async_get_evc_sessions:evc-001",
             "publish_evc_data:evc-serial-001",
+            "publish_evc_device:evc-serial-001",
             # Settings (every 10 minutes, also on first)
             "async_get_inverter_settings:inv001",
             "publish_registers:inv001",
@@ -2727,6 +2759,22 @@ def _test_run_method(my_predbat):
             print("Expected: {}".format(expected_order))
             print("Got:      {}".format(call_order))
             return 1
+
+        # The EVC wiring is off unless asked for - it registers a car and moves num_cars,
+        # so an existing ge_cloud_automatic user must not get it from an upgrade alone
+        if "async_automatic_config_evc" in call_order:
+            print("ERROR: EVC automatic config ran with ge_cloud_automatic_evc off")
+            return 1
+
+        # ... and runs on the first cycle once it is enabled
+        ge_cloud.automatic_evc = True
+        call_order = []
+        result = await ge_cloud.run(seconds=0, first=True)
+
+        if "async_automatic_config_evc" not in call_order:
+            print("ERROR: EVC automatic config did not run with ge_cloud_automatic_evc on, got {}".format(call_order))
+            return 1
+        ge_cloud.automatic_evc = False
 
         # Test subsequent run at seconds=120 (not first, but divisible by 120)
         call_order = []
@@ -2748,6 +2796,7 @@ def _test_run_method(my_predbat):
             "async_get_evc_device_data:evc-001",
             "async_get_evc_sessions:evc-001",
             "publish_evc_data:evc-serial-001",
+            "publish_evc_device:evc-serial-001",
         ]
 
         if call_order != expected_order_120:
@@ -2771,6 +2820,7 @@ def _test_run_method(my_predbat):
             "async_get_evc_device_data:evc-001",
             "async_get_evc_sessions:evc-001",
             "publish_evc_data:evc-serial-001",
+            "publish_evc_device:evc-serial-001",
             "async_get_inverter_settings:inv001",
             "publish_registers:inv001",
         ]
@@ -3239,28 +3289,55 @@ def _test_async_read_inverter_setting_success(my_predbat):
 
 
 def _test_async_read_inverter_setting_error_codes(my_predbat):
-    """Test error code handling in read inverter setting"""
+    """Test error code handling in read inverter setting
+
+    async_get_inverter_data unwraps the outer "data" envelope, so the handler sees the result
+    body directly. GivEnergy documents -3/-4/-7 as never succeeding on a repeat attempt, so
+    those must give up on the first response while -1/-2/-5/-6 keep the full retry budget.
+    """
 
     async def test():
-        ge_cloud = MockGECloudDirect()
+        for code in [-3, -4, -7]:
+            ge_cloud = MockGECloudDirect()
+            call_count = [0]
 
-        with patch("gecloud.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            # Test fatal error code (-3)
             async def mock_get_data_fatal(*args, **kwargs):
-                return {"data": {"value": -3}}
+                call_count[0] += 1
+                raise GECloudTerminalError(code, "Inverter Locked", "inverter_locked")
 
-            ge_cloud.async_get_inverter_data = mock_get_data_fatal
+            with patch("gecloud.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                ge_cloud.async_get_inverter_data = mock_get_data_fatal
+
+                result = await ge_cloud.async_read_inverter_setting("test123", 77)
+
+                if result is not None:
+                    print("ERROR: Expected None for fatal code {}, got {}".format(code, result))
+                    return 1
+                if call_count[0] != 1:
+                    print("ERROR: Expected code {} to give up after 1 attempt, got {}".format(code, call_count[0]))
+                    return 1
+                if mock_sleep.call_count != 0:
+                    print("ERROR: Expected no backoff for terminal code {}, slept {} times".format(code, mock_sleep.call_count))
+                    return 1
+
+        # A retryable code still uses the whole retry budget
+        ge_cloud = MockGECloudDirect()
+        retry_count = [0]
+
+        async def mock_get_data_retryable(*args, **kwargs):
+            retry_count[0] += 1
+            return {"value": -5, "success": False, "message": "There was a server error"}
+
+        with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+            ge_cloud.async_get_inverter_data = mock_get_data_retryable
 
             result = await ge_cloud.async_read_inverter_setting("test123", 77)
 
-            # Returns None for fatal errors after trying all retries
             if result is not None:
-                print("ERROR: Expected None for fatal error, got {}".format(result))
+                print("ERROR: Expected None for retryable code -5, got {}".format(result))
                 return 1
-
-            # Should have retried MAX_RETRIES times (default 3)
-            if mock_sleep.call_count == 0:
-                print("ERROR: Expected retries with sleeps, sleep called 0 times")
+            if retry_count[0] != 10:
+                print("ERROR: Expected 10 attempts for retryable code -5, got {}".format(retry_count[0]))
                 return 1
 
         return 0
@@ -3369,6 +3446,195 @@ def _test_async_write_inverter_setting_failure(my_predbat):
     return run_async(test())
 
 
+def _test_async_get_inverter_data_inverter_locked(my_predbat):
+    """A 200 response carrying success:false must be counted as a failure, not a success
+
+    GivEnergy answers a write to a locked inverter with HTTP 200 and a body of
+    {"value": -7, "success": false, "message": "Inverter Locked"}. Taking the 200 at face
+    value refreshed the component health timestamp and recorded a successful API call for a
+    write that never reached the inverter (issue #4896).
+    """
+
+    async def test():
+        ge_cloud = MockGECloudDirect()
+
+        mock_response = create_aiohttp_mock_response(status=200, json_data={"data": {"value": -7, "success": False, "message": "Inverter Locked"}})
+        mock_session = create_aiohttp_mock_session(mock_response)
+
+        recorded = []
+
+        with patch("aiohttp.ClientSession") as mock_session_class:
+            with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+                with patch("gecloud.record_api_call", side_effect=lambda *args, **kwargs: recorded.append(args)):
+                    mock_session_class.return_value = mock_session
+
+                    try:
+                        result = await ge_cloud.async_get_inverter_data(GE_API_INVERTER_WRITE_SETTING, "test123", 72, post=True, datain={"value": "10"})
+                        print("ERROR: Expected GECloudTerminalError for a locked inverter, got {}".format(result))
+                        return 1
+                    except GECloudTerminalError as exc:
+                        if exc.code != -7:
+                            print("ERROR: Expected code -7, got {}".format(exc.code))
+                            return 1
+                        if exc.reason != "inverter_locked":
+                            print("ERROR: Expected reason 'inverter_locked', got {}".format(exc.reason))
+                            return 1
+                        if "Inverter Locked" not in str(exc):
+                            print("ERROR: Expected the GivEnergy message in the exception, got {}".format(exc))
+                            return 1
+
+        if ge_cloud.last_success_timestamp is not None:
+            print("ERROR: Expected last_success_timestamp to stay unset for a rejected write")
+            return 1
+        if ge_cloud.failures_total != 1:
+            print("ERROR: Expected failures_total=1, got {}".format(ge_cloud.failures_total))
+            return 1
+        if recorded != [("givenergy", False, "inverter_locked")]:
+            print("ERROR: Expected the failure recorded as inverter_locked, got {}".format(recorded))
+            return 1
+        return 0
+
+    return run_async(test())
+
+
+def _test_async_get_inverter_data_retryable_body_failure(my_predbat):
+    """A retryable success:false body returns None so the caller's retry loop still runs"""
+
+    async def test():
+        ge_cloud = MockGECloudDirect()
+
+        mock_response = create_aiohttp_mock_response(status=200, json_data={"data": {"value": -5, "success": False, "message": "There was a server error"}})
+        mock_session = create_aiohttp_mock_session(mock_response)
+
+        recorded = []
+
+        with patch("aiohttp.ClientSession") as mock_session_class:
+            with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+                with patch("gecloud.record_api_call", side_effect=lambda *args, **kwargs: recorded.append(args)):
+                    mock_session_class.return_value = mock_session
+
+                    result = await ge_cloud.async_get_inverter_data(GE_API_INVERTER_WRITE_SETTING, "test123", 72, post=True, datain={"value": "10"})
+
+        if result != {"value": -5, "success": False, "message": "There was a server error"}:
+            print("ERROR: Expected the body returned so the caller can retry on the code, got {}".format(result))
+            return 1
+        if ge_cloud.last_success_timestamp is not None:
+            print("ERROR: Expected last_success_timestamp to stay unset for a failed call")
+            return 1
+        if recorded != [("givenergy", False, "server_error")]:
+            print("ERROR: Expected the failure recorded as server_error, got {}".format(recorded))
+            return 1
+        return 0
+
+    return run_async(test())
+
+
+def _test_async_write_inverter_setting_locked(my_predbat):
+    """A terminal failure aborts the write on the first response instead of retrying 10 times"""
+
+    async def test():
+        for code in [-3, -4, -7]:
+            ge_cloud = MockGECloudDirect()
+            ge_cloud.pending_writes["test123"] = []
+            call_count = [0]
+
+            async def mock_get_data(*args, **kwargs):
+                call_count[0] += 1
+                raise GECloudTerminalError(code, "Inverter Locked", "inverter_locked")
+
+            with patch("gecloud.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                ge_cloud.async_get_inverter_data = mock_get_data
+
+                result = await ge_cloud.async_write_inverter_setting("test123", 72, "10")
+
+                if result is not None:
+                    print("ERROR: Expected None for a rejected write, got {}".format(result))
+                    return 1
+                if call_count[0] != 1:
+                    print("ERROR: Expected code {} to abort the write after 1 attempt, got {}".format(code, call_count[0]))
+                    return 1
+                if mock_sleep.call_count != 0:
+                    print("ERROR: Expected no retry backoff for code {}, slept {} times".format(code, mock_sleep.call_count))
+                    return 1
+
+            if ge_cloud.pending_writes["test123"]:
+                print("ERROR: Expected no pending write to be recorded for a rejected write")
+                return 1
+            if not any("Inverter Locked" in message and str(code) in message for message in ge_cloud.log_messages):
+                print("ERROR: Expected the GivEnergy message and code {} to be logged, got {}".format(code, ge_cloud.log_messages))
+                return 1
+        return 0
+
+    return run_async(test())
+
+
+def _test_async_get_inverter_data_terminal_code_without_success_flag(my_predbat):
+    """A terminal result code is a failure even when the body omits the success flag
+
+    Some setting read/write responses carry the negative code without also setting
+    success=false. Keying the classification on that flag alone let those bodies refresh the
+    component health timestamp and count as a successful API call (PR #4902 review).
+    """
+
+    async def test():
+        ge_cloud = MockGECloudDirect()
+
+        mock_response = create_aiohttp_mock_response(status=200, json_data={"data": {"value": -7, "message": "Inverter Locked"}})
+        mock_session = create_aiohttp_mock_session(mock_response)
+
+        recorded = []
+
+        with patch("aiohttp.ClientSession") as mock_session_class:
+            with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+                with patch("gecloud.record_api_call", side_effect=lambda *args, **kwargs: recorded.append(args)):
+                    mock_session_class.return_value = mock_session
+
+                    try:
+                        result = await ge_cloud.async_get_inverter_data(GE_API_INVERTER_WRITE_SETTING, "test123", 72, post=True, datain={"value": "10"})
+                        print("ERROR: Expected GECloudTerminalError for a bare terminal code, got {}".format(result))
+                        return 1
+                    except GECloudTerminalError as exc:
+                        if exc.code != -7 or exc.reason != "inverter_locked":
+                            print("ERROR: Expected code -7 / inverter_locked, got {} / {}".format(exc.code, exc.reason))
+                            return 1
+
+        if ge_cloud.last_success_timestamp is not None:
+            print("ERROR: Expected last_success_timestamp to stay unset for a rejected write")
+            return 1
+        if recorded != [("givenergy", False, "inverter_locked")]:
+            print("ERROR: Expected the failure recorded as inverter_locked, got {}".format(recorded))
+            return 1
+        return 0
+
+    return run_async(test())
+
+
+def _test_async_get_inverter_data_negative_value_other_endpoint(my_predbat):
+    """Outside the setting endpoints a negative "value" is data, not a result code"""
+
+    async def test():
+        ge_cloud = MockGECloudDirect()
+
+        mock_response = create_aiohttp_mock_response(status=200, json_data={"data": {"value": -7}})
+        mock_session = create_aiohttp_mock_session(mock_response)
+
+        with patch("aiohttp.ClientSession") as mock_session_class:
+            with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+                mock_session_class.return_value = mock_session
+
+                result = await ge_cloud.async_get_inverter_data(GE_API_DEVICES)
+
+        if result != {"value": -7}:
+            print("ERROR: Expected the body returned unchanged, got {}".format(result))
+            return 1
+        if ge_cloud.last_success_timestamp is None:
+            print("ERROR: Expected a successful call to update last_success_timestamp")
+            return 1
+        return 0
+
+    return run_async(test())
+
+
 # =============================================================================
 # Event Handler Tests
 # =============================================================================
@@ -3403,7 +3669,7 @@ def _test_switch_event(my_predbat):
             if len(write_calls) != 1:
                 print("ERROR: Expected 1 write call, got {}".format(len(write_calls)))
                 return 1
-            if write_calls[0]["value"] != True:
+            if write_calls[0]["value"] is not True:
                 print("ERROR: Expected value=True for turn_on, got {}".format(write_calls[0]["value"]))
                 return 1
 
@@ -3413,7 +3679,7 @@ def _test_switch_event(my_predbat):
             if len(write_calls) != 2:
                 print("ERROR: Expected 2 write calls, got {}".format(len(write_calls)))
                 return 1
-            if write_calls[1]["value"] != False:
+            if write_calls[1]["value"] is not False:
                 print("ERROR: Expected value=False for turn_off, got {}".format(write_calls[1]["value"]))
                 return 1
 
@@ -4169,6 +4435,249 @@ def _test_async_automatic_config(my_predbat):
     return run_async(test())
 
 
+def _test_publish_evc_device(my_predbat):
+    """Test publishing the EVC status and the derived car connected binary sensor"""
+
+    async def test():
+        ge = MockGECloudDirect()
+
+        # Test 1: a charging session publishes the raw status and reads as connected
+        await ge.publish_evc_device("EVC123456", {"serial_number": "EVC123456", "status": "charging"})
+        status_entity = "sensor.predbat_gecloud_evc123456_evc_status"
+        connected_entity = "binary_sensor.predbat_gecloud_evc123456_evc_car_connected"
+        assert ge.dashboard_items.get(status_entity, {}).get("state") == "charging", "EVC status should be published raw"
+        assert ge.dashboard_items.get(connected_entity, {}).get("state") == "on", "A charging EVC should read as a car connected"
+
+        # Test 2: idle means nothing is plugged in
+        await ge.publish_evc_device("EVC123456", {"status": "idle"})
+        assert ge.dashboard_items[connected_entity]["state"] == "off", "An idle EVC should read as no car connected"
+
+        # Test 3: the OCPP session stages count as connected, whatever their casing
+        for status in ["Preparing", "SuspendedEV", "SuspendedEVSE", "Finishing", "Charging"]:
+            await ge.publish_evc_device("EVC123456", {"status": status})
+            assert ge.dashboard_items[connected_entity]["state"] == "on", "{} should read as a car connected".format(status)
+
+        # Test 4: the disconnected statuses, including a charger that has gone offline
+        for status in ["Available", "offline", "Unavailable", "Faulted", "Reserved"]:
+            await ge.publish_evc_device("EVC123456", {"status": status})
+            assert ge.dashboard_items[connected_entity]["state"] == "off", "{} should read as no car connected".format(status)
+
+        # Test 5: an unrecognised status is safe (no car) but says so once, not every poll
+        ge.log_messages = []
+        await ge.publish_evc_device("EVC123456", {"status": "not_a_real_status"})
+        assert ge.dashboard_items[connected_entity]["state"] == "off", "An unknown status should read as no car connected"
+        warnings = [message for message in ge.log_messages if "not_a_real_status" in message]
+        assert len(warnings) == 1, "An unknown EVC status should be reported once, got {}".format(len(warnings))
+        await ge.publish_evc_device("EVC123456", {"status": "not_a_real_status"})
+        warnings = [message for message in ge.log_messages if "not_a_real_status" in message]
+        assert len(warnings) == 1, "An unknown EVC status should not be reported again on the next poll"
+
+        # Test 6: no status at all publishes nothing rather than inventing a state
+        ge.dashboard_items = {}
+        await ge.publish_evc_device("EVC999999", {"serial_number": "EVC999999"})
+        assert not ge.dashboard_items, "A device with no status should publish nothing, got {}".format(ge.dashboard_items)
+
+        return 0
+
+    return run_async(test())
+
+
+def _test_async_automatic_config_evc(my_predbat):
+    """Test automatic configuration of Predbat car charging inputs from GE Cloud EV chargers"""
+
+    async def test():
+        ge = MockGECloudDirect()
+
+        # Test 1: two chargers wire both car keys, ordered by serial so charger N is car N
+        ge.config_args = {}
+        ge.evc_device_list = ["evc-002", "evc-001"]
+        ge.evc_device = {
+            "evc-001": {"serial_number": "EVC200", "status": "charging"},
+            "evc-002": {"serial_number": "EVC100", "status": "idle"},
+        }
+
+        await ge.async_automatic_config_evc()
+
+        assert ge.config_args.get("car_charging_energy") == [
+            "sensor.predbat_gecloud_evc100_evc_energy_active_import_register",
+            "sensor.predbat_gecloud_evc200_evc_energy_active_import_register",
+        ], "car_charging_energy should list both chargers in serial order, got {}".format(ge.config_args.get("car_charging_energy"))
+        assert ge.config_args.get("car_charging_planned") == [
+            "binary_sensor.predbat_gecloud_evc100_evc_car_connected",
+            "binary_sensor.predbat_gecloud_evc200_evc_car_connected",
+        ], "car_charging_planned should list both chargers in serial order, got {}".format(ge.config_args.get("car_charging_planned"))
+        # Display-only live power, wired in the same serial order so it describes the same chargers
+        assert ge.config_args.get("car_charging_power") == [
+            "sensor.predbat_gecloud_evc100_evc_power_active_import",
+            "sensor.predbat_gecloud_evc200_evc_power_active_import",
+        ], "car_charging_power should list both chargers in serial order, got {}".format(ge.config_args.get("car_charging_power"))
+        assert ge.config_args.get("num_cars") == 2, "num_cars should be raised to the number of chargers"
+
+        # Test 2: an existing larger num_cars is left alone - another component may own those cars
+        ge.config_args = {"num_cars": 3}
+        await ge.async_automatic_config_evc()
+        assert ge.config_args.get("num_cars") == 3, "num_cars should not be reduced to the charger count"
+
+        # Test 3: no chargers configures nothing at all
+        ge.config_args = {}
+        ge.evc_device_list = []
+        ge.evc_device = {}
+        await ge.async_automatic_config_evc()
+        assert ge.config_args.get("car_charging_energy") is None, "car_charging_energy should be left alone with no chargers"
+        assert ge.config_args.get("car_charging_planned") is None, "car_charging_planned should be left alone with no chargers"
+        assert ge.config_args.get("car_charging_power") is None, "car_charging_power should be left alone with no chargers"
+        assert ge.config_args.get("num_cars") is None, "num_cars should be left alone with no chargers"
+
+        # Test 4: a charger whose serial has not been read yet is skipped rather than
+        # publishing an entity name with a hole in it
+        ge.config_args = {}
+        ge.evc_device_list = ["evc-001", "evc-003"]
+        ge.evc_device = {"evc-001": {"serial_number": "EVC100"}, "evc-003": {"serial_number": None}}
+        await ge.async_automatic_config_evc()
+        assert ge.config_args.get("car_charging_energy") == ["sensor.predbat_gecloud_evc100_evc_energy_active_import_register"], "A charger with no serial should be skipped"
+        assert ge.config_args.get("num_cars") == 1, "num_cars should count only the chargers actually wired"
+
+        return 0
+
+    return run_async(test())
+
+
+EVC_PLAN_SENSOR = "binary_sensor.predbat_car_charging_slot"
+EVC_PLAN_SENSOR_CAR_1 = "binary_sensor.predbat_car_charging_slot_1"
+
+
+def _evc_control_component(commands, num_cars=1):
+    """Build a mock component with EVC control live and its commands recorded."""
+    ge = MockGECloudDirect()
+    ge.evc_control = True
+    ge.automatic_evc = True
+    ge.evc_control_enable()
+    ge.base.num_cars = num_cars
+
+    async def mock_send(uuid, command, params):
+        commands.append((uuid, command))
+        return {"success": True}
+
+    ge.async_send_evc_command = mock_send
+    return ge
+
+
+def _test_evc_control(my_predbat):
+    """Test Predbat-led start/stop control of GivEnergy EV chargers from the car plan"""
+
+    async def test():
+        tz = pytz.timezone("Europe/London")
+        inside = tz.localize(datetime(2026, 8, 22, 23, 30))
+        outside = tz.localize(datetime(2026, 8, 23, 6, 0))
+        plan = {EVC_PLAN_SENSOR: {"planned": [{"start": "08-22 23:00:00", "end": "08-23 05:00:00"}]}}
+
+        # Test 1: control stays off unless it is asked for
+        ge = MockGECloudDirect()
+        ge.automatic_evc = True
+        ge.evc_control_enable()
+        assert ge.evc_control_active is False, "Control should be off without ge_cloud_evc_control"
+
+        # Test 2: and refuses to run without the auto-config that maps chargers to cars
+        ge = MockGECloudDirect()
+        ge.evc_control = True
+        ge.evc_control_enable()
+        assert ge.evc_control_active is False, "Control needs ge_cloud_automatic_evc to know which charger is which car"
+        assert any("ge_cloud_automatic_evc" in message for message in ge.log_messages), "The reason control is off should be logged"
+
+        # Test 3: a planned window starts the charger, and is not re-sent every poll
+        commands = []
+        ge = _evc_control_component(commands)
+        ge.evc_device_list = ["evc-001"]
+        ge.evc_device = {"evc-001": {"serial_number": "EVC100", "status": "charging"}}
+        ge.entity_attributes = plan
+
+        await ge.evc_control_charge(inside)
+        assert commands == [("evc-001", "start-charge")], "A planned window should start the charge, got {}".format(commands)
+
+        commands.clear()
+        await ge.evc_control_charge(inside)
+        assert commands == [], "The same state should not be re-sent, got {}".format(commands)
+
+        # Test 4: outside the window the charger is stopped
+        commands.clear()
+        await ge.evc_control_charge(outside)
+        assert commands == [("evc-001", "stop-charge")], "Outside a window the charge should stop, got {}".format(commands)
+
+        # Test 5: read only mode hands the charger back, once
+        commands.clear()
+        ge._read_only = True
+        await ge.evc_control_tick(outside)
+        assert commands == [("evc-001", "start-charge")], "Releasing should hand a stopped charger back, got {}".format(commands)
+        assert ge.evc_control_released is True, "The release should be remembered"
+
+        commands.clear()
+        await ge.evc_control_tick(outside)
+        assert commands == [], "A release should happen once, not every cycle"
+
+        # Test 6: turning the control switch off releases in the same way
+        commands = []
+        ge = _evc_control_component(commands)
+        ge.evc_device_list = ["evc-001"]
+        ge.evc_device = {"evc-001": {"serial_number": "EVC100", "status": "charging"}}
+        ge.entity_attributes = plan
+        await ge.evc_control_charge(outside)
+        commands.clear()
+        await ge.switch_event("switch.predbat_gecloud_evc_control", "turn_off")
+        assert ge.evc_control_enabled is False, "The switch should turn control off"
+        await ge.evc_control_tick(outside)
+        assert commands == [("evc-001", "start-charge")], "Switching control off should release the charger, got {}".format(commands)
+
+        # Test 7: nothing is commanded while no car is plugged in
+        commands = []
+        ge = _evc_control_component(commands)
+        ge.evc_device_list = ["evc-001"]
+        ge.evc_device = {"evc-001": {"serial_number": "EVC100", "status": "idle"}}
+        ge.entity_attributes = plan
+        await ge.evc_control_charge(inside)
+        assert commands == [], "An empty charger should not be commanded, got {}".format(commands)
+
+        # Test 8: nothing is commanded before Predbat has published a plan, so a restart
+        # cannot stop a charge that is already running
+        commands = []
+        ge = _evc_control_component(commands)
+        ge.evc_device_list = ["evc-001"]
+        ge.evc_device = {"evc-001": {"serial_number": "EVC100", "status": "charging"}}
+        await ge.evc_control_charge(inside)
+        assert commands == [], "With no plan published nothing should be commanded, got {}".format(commands)
+
+        # Test 9: charger N is car N by serial order, matching the automatic configuration
+        commands = []
+        ge = _evc_control_component(commands, num_cars=2)
+        ge.evc_device_list = ["evc-second", "evc-first"]
+        ge.evc_device = {
+            "evc-first": {"serial_number": "EVC200", "status": "charging"},
+            "evc-second": {"serial_number": "EVC100", "status": "charging"},
+        }
+        ge.entity_attributes = {EVC_PLAN_SENSOR: plan[EVC_PLAN_SENSOR], EVC_PLAN_SENSOR_CAR_1: {"planned": []}}
+
+        await ge.evc_control_charge(inside)
+        assert sorted(commands) == sorted([("evc-second", "start-charge"), ("evc-first", "stop-charge")]), "The lower serial should be car 0, got {}".format(commands)
+
+        # Test 10: a charger with no car index yet is left alone rather than stopped.
+        # num_cars is raised by async_automatic_config_evc, but that lands on the base
+        # object a cycle later, so briefly there can be more chargers than cars.
+        commands = []
+        ge = _evc_control_component(commands, num_cars=1)
+        ge.evc_device_list = ["evc-first", "evc-second"]
+        ge.evc_device = {
+            "evc-first": {"serial_number": "EVC100", "status": "charging"},
+            "evc-second": {"serial_number": "EVC200", "status": "charging"},
+        }
+        ge.entity_attributes = {EVC_PLAN_SENSOR: plan[EVC_PLAN_SENSOR]}
+
+        await ge.evc_control_charge(inside)
+        assert commands == [("evc-first", "start-charge")], "Only the charger with a car should be commanded, got {}".format(commands)
+
+        return 0
+
+    return run_async(test())
+
+
 def _test_hybrid_detection(my_predbat):
     """Test hybrid vs AC-coupled inverter detection in async_automatic_config"""
 
@@ -4396,10 +4905,10 @@ def _test_enable_default_options(my_predbat):
         if not result:
             print("ERROR: enable_default_options should return True when enabling real-time control")
             return 1
-        if write_calls[0]["value"] != True:
+        if write_calls[0]["value"] is not True:
             print("ERROR: Expected value=True for real-time control, got {}".format(write_calls[0]["value"]))
             return 1
-        if registers[105]["value"] != True:
+        if registers[105]["value"] is not True:
             print("ERROR: Register value should be updated to True, got {}".format(registers[105]["value"]))
             return 1
 
