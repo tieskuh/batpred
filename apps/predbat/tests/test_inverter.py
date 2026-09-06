@@ -1553,6 +1553,9 @@ def test_service_repeat_interval(my_predbat, inv):
     my_predbat.last_service_hash = {}
     my_predbat.last_service_time = {}
     ha.service_store_enable = False
+    return failed
+
+
 def test_call_service_template_retry(test_name, my_predbat, inv):
     """A service call the HA layer rejects must be retried next cycle, not deduplicated away (#4876).
 
