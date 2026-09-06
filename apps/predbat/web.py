@@ -71,7 +71,7 @@ from web_helper import (
 
 from utils import calc_percent_limit, str2time, dp0, dp2, dp4, format_time_ago, get_override_time_from_string, history_attribute, prune_today, mask_secret_args, mask_secret_yaml_text, read_predbat_log, classify_log_line, log_line_included
 from utils import is_data_numerical, ROOT_YAML_KEY, YAML_DUMP_WIDTH, update_nested_yaml_value  # noqa: F401 - re-exported: moved to utils.py, agent_tools.py/chat_tools.py must not import from web.py
-from const import TIME_FORMAT, TIME_FORMAT_DAILY, TIME_FORMAT_HA
+from const import TIME_FORMAT, TIME_FORMAT_DAILY, TIME_FORMAT_HA, MANUAL_RATE_MAX_MINUTES, MANUAL_TIME_MAX_MINUTES
 from predbat import THIS_VERSION_DISPLAY
 from component_base import ComponentBase
 from config import APPS_SCHEMA
@@ -986,7 +986,7 @@ class WebInterface(ComponentBase):
         text += "<tr><td>Create</td><td><a href='./debug_yaml'>predbat_debug.yaml</a></td></tr>\n"
         text += "<tr><td>Download</td><td><a href='./debug_log'>predbat.log</a></td></tr>\n"
         text += "<tr><td>Download</td><td><a href='./debug_plan'>predbat_plan.html</a></td></tr>\n"
-        text += "<tr><td>History</td><td><a href='./debug_history_download_all'>Download all (.tgz)</a></td></tr>\n"
+        text += "<tr><td>History</td><td><a href='./debug_history_download_all'>Download all</a></td></tr>\n"
         text += "<tr><td>Restart</td><td><button onclick='restartPredbat()' style='background-color: #ff4444; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;'>Restart Predbat</button></td></tr>\n"
         # The HA Companion app's embedded webview does not act on Content-Disposition: attachment,
         # so it renders these downloads inline instead of saving them - a client limitation with no
@@ -2486,15 +2486,17 @@ chart.render();
         baseline_timestamp = baseline_json.get("timestamp", None) if baseline_json else None
 
         # Get current manual overrides
-        manual_charge_times = self.base.manual_times("manual_charge")
-        manual_export_times = self.base.manual_times("manual_export")
-        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge")
-        manual_freeze_export_times = self.base.manual_times("manual_freeze_export")
-        manual_demand_times = self.base.manual_times("manual_demand")
-        manual_import_rates = self.base.manual_rates("manual_import_rates")
-        manual_export_rates = self.base.manual_rates("manual_export_rates")
-        manual_load_adjust = self.base.manual_rates("manual_load_adjust")
-        manual_soc_keep = self.base.manual_rates("manual_soc")
+        # Read-only: these run on the web server's own thread, so writing the decoded
+        # selection back could persist times captured mid-recompute (#4900)
+        manual_charge_times = self.base.manual_times("manual_charge", update=False)
+        manual_export_times = self.base.manual_times("manual_export", update=False)
+        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge", update=False)
+        manual_freeze_export_times = self.base.manual_times("manual_freeze_export", update=False)
+        manual_demand_times = self.base.manual_times("manual_demand", update=False)
+        manual_import_rates = self.base.manual_rates("manual_import_rates", update=False)
+        manual_export_rates = self.base.manual_rates("manual_export_rates", update=False)
+        manual_load_adjust = self.base.manual_rates("manual_load_adjust", update=False)
+        manual_soc_keep = self.base.manual_rates("manual_soc", update=False)
 
         # Convert manual rates dicts to list format for JavaScript
         manual_import_rates_list = [{"minutes": k, "rate": v} for k, v in manual_import_rates.items()]
@@ -2580,15 +2582,17 @@ chart.render();
         baseline_json = self.get_state_wrapper(entity_id=self.prefix + ".savings_yesterday_predbat", attribute="json", default=None)
 
         # Fetch override data
-        manual_charge_times = self.base.manual_times("manual_charge")
-        manual_export_times = self.base.manual_times("manual_export")
-        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge")
-        manual_freeze_export_times = self.base.manual_times("manual_freeze_export")
-        manual_demand_times = self.base.manual_times("manual_demand")
-        manual_import_rates = self.base.manual_rates("manual_import_rates")
-        manual_export_rates = self.base.manual_rates("manual_export_rates")
-        manual_load_adjust = self.base.manual_rates("manual_load_adjust")
-        manual_soc_keep = self.base.manual_rates("manual_soc")
+        # Read-only: these run on the web server's own thread, so writing the decoded
+        # selection back could persist times captured mid-recompute (#4900)
+        manual_charge_times = self.base.manual_times("manual_charge", update=False)
+        manual_export_times = self.base.manual_times("manual_export", update=False)
+        manual_freeze_charge_times = self.base.manual_times("manual_freeze_charge", update=False)
+        manual_freeze_export_times = self.base.manual_times("manual_freeze_export", update=False)
+        manual_demand_times = self.base.manual_times("manual_demand", update=False)
+        manual_import_rates = self.base.manual_rates("manual_import_rates", update=False)
+        manual_export_rates = self.base.manual_rates("manual_export_rates", update=False)
+        manual_load_adjust = self.base.manual_rates("manual_load_adjust", update=False)
+        manual_soc_keep = self.base.manual_rates("manual_soc", update=False)
 
         # Convert manual rates dicts to list format for JavaScript
         manual_import_rates_list = [{"minutes": k, "rate": v} for k, v in manual_import_rates.items()]
@@ -2954,10 +2958,25 @@ chart.render();
             return web.Response(content_type="text/html", text="No debug-history snapshots found", status=404)
 
         archive_bytes = debug_history.build_archive(named_snapshots)
+        # The trailing .dmp is load-bearing, not decoration. Browsers that unarchive downloads
+        # whose extension they recognise - on by default in more than one - turn a .tgz into a
+        # bare .tar on the way down, and that is fatal here twice over: .tar is not a file type
+        # GitHub accepts as an attachment, and a real 15-snapshot history is ~32MB expanded
+        # against a 25MB attachment limit, where the archive itself is under 5MB. Compression is
+        # doing essential work, so the download has to reach the user still compressed.
+        #
+        # There is no server-side way to decline the unarchiving - it keys on the extension, not
+        # on the content type or Content-Disposition, both of which are set correctly below and
+        # were not enough on their own. So the file is named with an extension those browsers
+        # leave alone and GitHub still accepts. The body is an ordinary gzip tarball and
+        # "tar xzf" reads it whatever it is called, so nothing needs renaming to open it.
         return web.Response(
-            content_type="application/gzip",
+            content_type="application/octet-stream",
             body=archive_bytes,
-            headers={"Content-Disposition": "attachment; filename=predbat_debug_history.tgz"},
+            headers={
+                "Content-Disposition": 'attachment; filename="predbat_debug_history.tgz.dmp"',
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def html_file_load(self, filename, also_file=None, as_file=None):
@@ -4635,8 +4654,9 @@ chart.render();
             override_time = get_override_time_from_string(now_utc, time_str, self.plan_interval_minutes)
 
             minutes_from_now = (override_time - now_utc).total_seconds() / 60
-            if minutes_from_now >= 48 * 60:
-                return web.json_response({"success": False, "message": "Override time must be within 48 hours from now."}, status=400)
+            if minutes_from_now >= MANUAL_RATE_MAX_MINUTES:
+                max_hours = MANUAL_RATE_MAX_MINUTES // 60
+                return web.json_response({"success": False, "message": f"Override time must be within {max_hours} hours from now."}, status=400)
 
             # Calculate minutes from midnight for looking up existing rates
             minutes_from_midnight = int((override_time - self.midnight_utc).total_seconds() / 60)
@@ -4645,7 +4665,7 @@ chart.render();
 
             # For clear operations, we need to use the actual stored rate value, not the passed rate
             if action == "Clear Import":
-                manual_import_rates = self.base.manual_rates("manual_import_rates")
+                manual_import_rates = self.base.manual_rates("manual_import_rates", update=False)
                 actual_rate = manual_import_rates.get(minutes_from_midnight, rate)
                 clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_import_rates", clear_option)
@@ -4654,7 +4674,7 @@ chart.render();
                 await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_import_rates", selection_option)
             elif action == "Clear Export":
-                manual_export_rates = self.base.manual_rates("manual_export_rates")
+                manual_export_rates = self.base.manual_rates("manual_export_rates", update=False)
                 actual_rate = manual_export_rates.get(minutes_from_midnight, rate)
                 clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_export_rates", clear_option)
@@ -4667,7 +4687,7 @@ chart.render();
                 await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_load_adjust", selection_option)
             elif action == "Clear Load":
-                manual_load_adjust = self.base.manual_rates("manual_load_adjust")
+                manual_load_adjust = self.base.manual_rates("manual_load_adjust", update=False)
                 actual_rate = manual_load_adjust.get(minutes_from_midnight, rate)
                 clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_load_adjust", clear_option)
@@ -4676,7 +4696,7 @@ chart.render();
                 await self.set_state_external(item.get("entity", None), rate)
                 await self.base.async_manual_select("manual_soc", selection_option)
             elif action == "Clear SOC":
-                manual_soc = self.base.manual_rates("manual_soc")
+                manual_soc = self.base.manual_rates("manual_soc", update=False)
                 actual_rate = manual_soc.get(minutes_from_midnight, rate)
                 clear_option = "[{}={}]".format(override_time.strftime("%a %H:%M"), actual_rate)
                 await self.base.async_manual_select("manual_soc", clear_option)
@@ -4719,8 +4739,9 @@ chart.render();
                 return web.json_response({"success": False, "message": "Invalid time format"}, status=400)
 
             minutes_from_now = (override_time - now_utc).total_seconds() / 60
-            if minutes_from_now >= 48 * 60:
-                return web.json_response({"success": False, "message": "Override time must be within 48 hours from now."}, status=400)
+            if minutes_from_now >= MANUAL_TIME_MAX_MINUTES:
+                max_hours = MANUAL_TIME_MAX_MINUTES // 60
+                return web.json_response({"success": False, "message": f"Override time must be within {max_hours} hours from now."}, status=400)
 
             selection_option = "{}".format(override_time.strftime("%a %H:%M"))
             clear_option = "[{}]".format(override_time.strftime("%a %H:%M"))
