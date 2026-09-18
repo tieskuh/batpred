@@ -9,6 +9,7 @@
 # pylint: disable=attribute-defined-outside-init
 
 from tests.test_infra import MockConfigProvider
+from utils import dp3
 
 
 def test_fetch_config_options(my_predbat):
@@ -403,6 +404,42 @@ def test_fetch_config_options(my_predbat):
     my_predbat.fetch_config_options()
 
     print("✓ 8-car config resolution test passed")
+
+    # Test 16: car_charging_solar_limit degrades gracefully when its sensor is unavailable/unknown.
+    # This is fork-only code: get_arg is called with a None default, so a non-numeric HA state
+    # ('unavailable' when EVCC drops out) is returned verbatim and previously crashed
+    # get_car_charging_planned() with ValueError: could not convert string to float. It must fall
+    # back to car_charging_limit, exactly as an unconfigured limit already does.
+    print("\n*** Test 16: car_charging_solar_limit falls back on a non-numeric sensor ***")
+
+    solar_limit_value = {"v": None}
+
+    def solar_limit_get_arg(arg, *args, **kwargs):
+        if arg == "car_charging_solar_limit":
+            return solar_limit_value["v"]
+        return original_get_arg(arg, *args, **kwargs)
+
+    my_predbat.get_arg = solar_limit_get_arg
+    saved_num_cars = my_predbat.num_cars
+    my_predbat.num_cars = 1
+
+    # Non-numeric or missing values must all fall back to car_charging_limit without raising
+    for bad in ["unavailable", "unknown", "", None]:
+        solar_limit_value["v"] = bad
+        my_predbat.get_car_charging_planned()
+        assert my_predbat.car_charging_solar_limit[0] == my_predbat.car_charging_limit[0], "solar_limit should fall back to car_charging_limit for {!r}, got {}".format(bad, my_predbat.car_charging_solar_limit[0])
+
+    # A valid numeric value (string or float) must still be applied as a percentage of the battery size
+    for good in ["80", 80.0]:
+        solar_limit_value["v"] = good
+        my_predbat.get_car_charging_planned()
+        expected = dp3((80.0 * my_predbat.car_charging_battery_size[0]) / 100.0)
+        assert my_predbat.car_charging_solar_limit[0] == expected, "solar_limit should be {} for {!r}, got {}".format(expected, good, my_predbat.car_charging_solar_limit[0])
+
+    my_predbat.get_arg = original_get_arg
+    my_predbat.num_cars = saved_num_cars
+
+    print("✓ car_charging_solar_limit fallback test passed")
 
     print("\n**** All fetch_config_options tests passed! ****")
     return False

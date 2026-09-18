@@ -2449,7 +2449,14 @@ class Fetch:
             if solar_limit_pct is None:
                 self.car_charging_solar_limit[car_n] = self.car_charging_limit[car_n]
             else:
-                self.car_charging_solar_limit[car_n] = dp3((float(solar_limit_pct) * self.car_charging_battery_size[car_n]) / 100.0)
+                try:
+                    self.car_charging_solar_limit[car_n] = dp3((float(solar_limit_pct) * self.car_charging_battery_size[car_n]) / 100.0)
+                except (TypeError, ValueError):
+                    # Sensor is unavailable/unknown or otherwise non-numeric (e.g. EVCC drops out): fall back to
+                    # the grid plan target, exactly as an unconfigured car_charging_solar_limit already does.
+                    # Logged for visibility but not flagged as an error - a transient sensor gap is handled, not a fault.
+                    self.log("Warn: car_charging_solar_limit for car {} is not numeric ({}), falling back to car_charging_limit".format(car_n, solar_limit_pct))
+                    self.car_charging_solar_limit[car_n] = self.car_charging_limit[car_n]
 
             # Plugged-in status over the forecast horizon - falls back to "charging now" if no dedicated sensor is configured
             plugged = self.get_arg("car_charging_plugged", None, index=car_n)
