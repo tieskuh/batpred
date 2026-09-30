@@ -14,6 +14,41 @@ Arguments: `<issue-number> [scratch=<dir>]`. The scratch directory is a writable
 
 Fetch it with `gh issue view <number> --json title,body,labels,comments`. Note any labels already applied — never remove a label a human added.
 
+Comments from people other than the reporter ("me too" posts) are evidence by default, but don't assume they are the same problem. If one is clearly a different problem (see `/issue-me-too` step 3 for the bar), leave it out of your analysis. Record it in your comment on its own line as `Looks unrelated to this issue: <comment-url>`, and ask its author to open their own issue.
+
+## 1a. Split gate — one problem per ticket
+
+From the issue text alone, decide whether it reports more than one distinct problem, e.g. a plan that looks wrong *and* an inverter entity that won't update, or two unrelated errors. Several symptoms of one problem, like a wrong plan and the unexpected export it leads to, are one problem. Only take this path when the problems are clearly separate, meaning each could be fixed without touching the other. If unsure, treat it as one problem.
+
+If it is more than one, **stop here**, the same as the evidence gate below: no investigation, no theory, no duplicate search and no priority. Apply `waiting_for_user`, plus a type label only if every problem shares it (else `unclear`). Post the one comment (step 9) with the automated first-pass triage disclosure line, then:
+
+- list the separate problems you see, in one line each, in the reporter's own terms;
+- ask them to open a new issue for each problem after the first, and to trim this ticket down to the first. Name which one stays here;
+- ask them to attach the relevant log/debug files to each new issue (see the list in 1b), because each ticket is triaged separately.
+
+Apply `BOT_TRIAGED` as usual. The reporter's reply wakes a follow-up review, as in 1b.
+
+## 1b. Evidence gate — ask for files before investigating
+
+From the issue text alone, decide whether a proper analysis would need a `predbat.log`, a `predbat_debug.yaml`, or other evidence, and whether the reporter has already attached it. Typical cases that need it: a plan that looks wrong, unexpected charging/exporting, an inverter not doing what Predbat asked, an error or crash, wrong rates or forecasts. Typical cases that don't: a pure question, a feature request, a docs error, or a report whose cause is fully visible in the text or a pasted traceback.
+
+Evidence means the files themselves: a `predbat.log` or `predbat_debug.yaml` you can download and examine. A quoted log excerpt, a screenshot, or someone else's analysis (a `file:line` pointer, a replay result, a theory in the issue text) is not evidence for this gate. Partial log lines are seldom enough, and we always run our own analysis rather than trusting a third party's.
+
+The files do not have to be attached to this ticket. If the issue was spun out of another issue or PR (`split from #N`, `see #N`, a link to a specific comment) and the source already has the log or debug yaml covering this problem, that counts. Check the referenced issue with `gh issue view <N> --json body,comments` for attachments. If it has what is needed, don't ask again: carry on with step 2 and fetch the files from the source ticket, saying in the comment which ticket they came from. Only fall into the gate below if neither this ticket nor its source has the evidence.
+
+If the needed evidence is missing, **stop here** and take the short path instead of steps 2–8:
+
+- Do **not** investigate the code, run tests, read the debug journal, or offer any theory, hypothesis, likely cause or workaround — not even a hedged one. A guess made without the evidence anchors everyone on it.
+- Apply `waiting_for_user`, plus a type label (step 3) only if it is obvious from the text, else `unclear`. Apply a component label (step 6) only if the issue names one. No priority, no duplicate search.
+- Post the one comment (step 9), opening with the automated first-pass triage disclosure line, saying that detailed triage is on hold until the files below are attached, and asking for exactly what is missing:
+    - **If the problem is happening now or will happen again:** a `predbat_debug.yaml` and `predbat.log` captured while it is happening — both from the **Debug** panel on Predbat's web interface. The debug file downloads as `predbat_debug.yaml.txt` and can be attached as-is.
+    - **If the incident is over:** the debug snapshot for that time, from the **Debug** column on the plan's **History** view (Predbat web interface → Plan → History), next to the time slot when the problem happened. With default settings only around the last 48 hours are kept, so ask them to grab it soon. Also ask for a `predbat.log` covering that period, if they still have one.
+    - **Other evidence, only where it fits the report:** logs from the integration involved (e.g. GivTCP, Solis/Solax/Fox, the Octopus integration, the HA core log), their `apps.yaml` renamed to `apps.txt`, screenshots of the plan or HA history graphs of the relevant entities, and when it happened (date, time, timezone).
+    - Link the [debug history docs](https://springfall2008.github.io/batpred/customisation/#debug-history) for the snapshot details.
+- Apply `BOT_TRIAGED` as usual (end of step 9). When the reporter next comments, the daemon clears `waiting_for_user` and queues `/issue-triage-followup`, which does the full investigation if the files have arrived.
+
+If the evidence is already attached, or the issue doesn't need any, carry on with step 2.
+
 ## 2. Fetch attachments
 
 If the body links a log file, a `predbat_debug.yaml`, or a zip of either, download it into the scratch directory rather than pulling it through WebFetch — a `predbat.log` is routinely tens of MB, well past what WebFetch will return.
@@ -32,7 +67,7 @@ sed -n '<start>,<end>p' <scratch>/predbat.log     # context around an interestin
 
 The log gives you error/traceback context; the debug yaml gives you the reporter's actual configuration (grep it for the specific keys you care about if it is large). The reporter's Predbat version is usually in the first few lines of the log — quote the version you actually confirmed, not the one in the issue template.
 
-A `predbat_debug.yaml` can also be replayed against current main to reproduce their plan and list every setting they have changed from default — see [references/debug-journal.md](references/debug-journal.md).
+A `predbat_debug.yaml` can also be replayed against current main to reproduce their plan and list every setting they have changed from default — see [tools/debug-journal.md](../../../tools/debug-journal.md).
 
 ## 3. Classify the type
 
@@ -54,7 +89,7 @@ Search existing issues (`gh issue list --search ...`, both open and closed) for 
   git describe --tags        # the version you are investigating against
   ```
 
-- Read [references/debug-journal.md](references/debug-journal.md) before forming a hypothesis. It maps common symptoms to modules, records known per-integration behaviour from past investigations, and lists the traps that have wasted time before. Its entries are dated observations, not current truth — confirm anything you rely on against the working tree.
+- Read [tools/debug-journal.md](../../../tools/debug-journal.md) before forming a hypothesis. It maps common symptoms to modules, records known per-integration behaviour from past investigations, and lists the traps that have wasted time before. Its entries are dated observations, not current truth — confirm anything you rely on against the working tree.
 - Read the relevant source area for the reported symptom (e.g. `apps/predbat/fetch.py` for rate issues, `apps/predbat/inverter.py` for a named inverter).
 - Check `git log` / `git blame` on that area for recent related changes — the issue may already be fixed on main since the version the reporter is using.
 - If the issue clearly maps to an existing test module (`apps/predbat/tests/test_<feature>.py`, listed in `TEST_REGISTRY` in `unit_test.py`), run just that test with the wrapper, from the repo root:

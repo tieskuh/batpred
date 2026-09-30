@@ -71,7 +71,11 @@ tools/triage_test.sh <name> <scratch>/test.log
 
 Use the test module the changed area maps to in `TEST_REGISTRY` (`apps/predbat/unit_test.py`), or `./run_all --quick` (from `coverage/`, same as above) if there's no clean single-module mapping.
 If either still fails, go to step 7 and report what's still broken — do not push a change that doesn't pass its own quality gate,
-even if step 2's merge commit already exists locally: an unpushed local commit is discarded automatically the next time this runs.
+even if step 2's merge commit already exists locally.
+
+Run both in the foreground and wait for them to finish; the pre-commit run plus the quick suite takes a few minutes, well inside a single command's timeout. This is a non-interactive run: once you write your final message the session is over, and nothing comes back later to read a result or finish the job. Never end on "still running, I'll push when it finishes". PR #5216's cleanup did exactly that on 2026-09-26: its fixes were never committed, and the leftover edits blocked every later bot run until they were cleared by hand.
+
+The daemon checks the clone after you exit. Uncommitted changes or unpushed commits mark the run failed (`BOT_FAILED`), and they are stashed rather than discarded. A run that stops at a failed quality gate is therefore reported as a failure even after posting its summary comment, which is correct, because the cleanup did not complete.
 
 ## 7. Commit, push, and reply
 
@@ -80,6 +84,8 @@ git add <changed files>
 git commit -m "<one-line summary of the fixes>"
 git push
 ```
+
+`git push` with no arguments, and nothing else. The branch already has an upstream from `gh pr checkout`, so naming a remote or a ref is never necessary — and if a bare push fails, that is information, not something to route around. **Do not retry with a different target.** A push that fails because the PR's head branch lives in a fork cannot be made to work: the credential can only write to `springfall2008/batpred`, and retrying against `origin` means pushing to *this* repo, whose default branch is `main`. That is exactly how an unreviewed commit reached upstream `main` on 2026-09-06. Stop at step 7 and report the failure instead; the daemon now filters fork-head PRs out before they reach you, so hitting this at all means something is wrong.
 
 Skip the commit if step 5 had nothing to implement — step 2's merge commit (if any) is already complete and just needs pushing.
 Reply to each review thread you addressed, in the thread itself, not as a new top-level comment. Open every reply with a short line disclosing it is an automated reply from the triage bot, then state what changed:

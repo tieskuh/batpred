@@ -59,7 +59,7 @@ Once you get everything working please share the configuration as a GitHub issue
    | [Solax Gen4 inverters](#solax-gen4-inverters) | [Solax Modbus integration](https://github.com/wills106/homeassistant-solax-modbus)<BR>in Modbus Power Control Mode | [solax_sx4.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/solax_sx4.yaml) |
    | [Solis Cloud](#solis-cloud) | Predbat | [solis_cloud.yaml](https://raw.githubusercontent.com/springfall2008/batpred/refs/heads/main/templates/solis_cloud.yaml) |
    | [Solis Hybrid inverters (Firmware before FB00)](#solis-inverters-before-fb00) | [Solax Modbus integration](https://github.com/wills106/homeassistant-solax-modbus) | [ginlong_solis.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/ginlong_solis.yaml) |
-   | [Solis Hybrid inverters (Firmware FB00 and later)](#solis-inverters-fb00-or-later) | [Solax Modbus integration](https://github.com/wills106/homeassistant-solax-modbus) | [ginlong_solis.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/ginlong_solis.yaml) |
+   | [Solis Hybrid inverters (Firmware FB00 and later)](#solis-inverters-fb00-or-later) | [Solax Modbus integration](https://github.com/wills106/homeassistant-solax-modbus) | [ginlong_solis_fb00.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/ginlong_solis_fb00.yaml) |
    | [Sunsynk Cloud](#sunsynk-cloud) | Predbat | See [apps.yaml](apps-yaml.md#sunsynk-cloud-api) |
    | [SunSynk](#sunsynk) | [Sunsynk](https://github.com/kellerza/sunsynk) | [sunsynk.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/sunsynk.yaml) |
    | [Tesla Powerwall](#tesla-powerwall) | [Tesla Fleet](https://www.home-assistant.io/integrations/tesla_fleet) or [Teslemetry](https://www.home-assistant.io/integrations/teslemetry) | [tesla_powerwall.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/tesla_powerwall.yaml) |
@@ -89,7 +89,7 @@ It's recommended that you first watch the [Installing GivTCP and Mosquitto Apps 
 '[https://github.com/britkat1980/ha-addons](https://github.com/britkat1980/ha-addons')' into the text box and click 'Add' then 'Close'<BR>
 NB: this URL is for GivTCP v3, not v2 as covered in the video.
 - Click the back button and then re-navigate to Settings / Apps / Install app so Home Assistant picks up the GivTCP app from the custom repository
-- Scroll down the app list, to find 'GivTCP-V3', you should see the three addons; the production version, the latest beta and the latest dev versions.
+- Scroll down the app list, to find 'GivTCP-V3', you should see the three apps; the production version, the latest beta and the latest dev versions.
 Click on the 'GivTCP' app, then click 'INSTALL'
 - Once GivTCP has been installed, ensure that the 'Start on boot' and 'Watchdog' options are turned on
 
@@ -107,7 +107,7 @@ Click on the 'GivTCP' app, then click 'INSTALL'
   For example, if you have a gateway and two AIOs you could use the prefixes 'GW', 'AIO-1' and 'AIO-2'.
   The prefixes should be set before you start using GivTCP in anger
   as changing the prefixes later on will result in both the old and new sensor names appearing in Home Assistant with the 'old' sensors being "unavailable".<BR>
-  Note that if you do change the givtcp prefixes then you will also have to edit the apps.yaml configuration file to match,
+  Note that if you do change the givtcp prefixes then you will also have to edit the `apps.yaml` configuration file to match,
   and change the sensor names that Predbat is looking for (by default prefixed 'givtcp_xxx') to your new sensor naming structure
 
 - Click Next and Next to get to the Selfrun page, and turn on Self Run so that GivTCP automatically retrieves data from your inverter. The Self Run Loop Timer is how often GivTCP will retrieve data - it's
@@ -185,6 +185,7 @@ This is being worked on by the author of GivTCP, e.g. see [GivTCP issue: unable 
     - Set geseriale to the EMS inverter serial number (look in HA for the entity names)
 - Predbat will auto-configure itself to use the appropriate GE Cloud controls for the EMS and if you add extra inverter and battery controls to `apps.yaml`, these will be ignored
 - As Predbat will only use slot 1, turn off charge, export and discharge slots 2, 3 and 4  - set the start and end times for these to 00:00
+- On each battery inverter, leave its own charge slot 1 and DC discharge slot 1 set to 00:00-23:59 so that they never override a command from the EMS. Predbat re-reads the inverter settings hourly and will warn in the log, and in the Predbat status, if it finds a slot 1 window set to anything else.
 - If your EMS does not return accurate **load_today** energy information, you can [override the GE Cloud load data](apps-yaml.md) by creating a custom template sensor and setting **ge_cloud_load_today_ignore** to `true` in `apps.yaml`.
 
 ## GivEnergy Octopus Cloud Direct - No Home Assistant
@@ -975,7 +976,7 @@ Max value: (Inverter Battery max charge in watt)
 input_number.predbat_discharge_rate     # this is used to set battery discharge to zero
 Min value: 0
 Max value: (Inverter Battery max discharge in watt)
-```text
+```
 
 - To control the Kostal inverter you need to use a modbus/tcp connection, this is not a part of the Kostal integration. Add the following modbus configuration to your `configuration.yaml`:
 
@@ -1734,8 +1735,7 @@ triggers:
       entity_id: automation.luxpower_freeze_charge_watchdog
 
   mode: single
-
-  ```
+```
 
 **Enable Freeze Charging**
 
@@ -1753,7 +1753,7 @@ If you have a LuxPower inverter with the **Charge Last** feature, enable the Pre
 **Note**
 Freeze Exporting requires fewer supporting automations than Freeze Charging, as it relies primarily on inverter-side behaviour. No additional watchdog or guard logic is required.
 
- In your `apps.yaml` file:
+In your `apps.yaml` file:
 
 - Look for `support_discharge_freeze` in the inverter section and change `False` to `True`
     - Uncomment the last two lines of the `discharge_stop_service` section so Predbat turns `switch.lux_charge_last` off when Freeze exporting stops.
@@ -1776,7 +1776,7 @@ After Predbat recomputes, you may see some dark grey **FrzExp** slots in the sta
 ```yaml
 name: Predbat Ready
 entity_id: input_boolean.predbat_ready
-```text
+```
 
 The `predbat_ready` helper prevents automation actions until LuxPower entities are fully available after startup. Ensure it is On after it has been created.
 
@@ -2323,7 +2323,7 @@ sensor:
 
 If you have multiple batteries connected to your SolarEdge inverter and are using the SolarEdge Modbus Multi integration, this enumerates the multiple batteries as b1, b2, b3, etc with separate entities per battery.
 
-You will need to make a number of changes to the solaredge apps.yaml, replacing the following entries:
+You will need to make a number of changes to the solaredge `apps.yaml`, replacing the following entries:
 
 ```yaml
   battery_rate_max:
@@ -2661,7 +2661,7 @@ To run PredBat with Solis hybrid inverters with firmware level prior to FB00 (yo
    | `sensor.solis_rtc`           | Real Time Clock |
    | `sensor.solis_battery_power` | Battery Power   |
 
-3. Copy the template <https://github.com/springfall2008/batpred/blob/main/templates/gilong_solis.yaml> over the top of your `apps.yaml`, and modify it for your system
+3. Copy the template <https://github.com/springfall2008/batpred/blob/main/templates/ginlong_solis.yaml> over the top of your `apps.yaml`, and modify it for your system
 
 4. Set **solax_modbus_new** in `apps.yaml` to True if you have integration version 2024.03.2 or greater
 
@@ -2684,36 +2684,36 @@ To run PredBat with Solis hybrid inverters with firmware level FB00 or later (yo
 
 1. Install PredBat as per the [Installation Summary](installation-summary.md)
 
-2. Ensure that you have the Solax Modbus integration running and select the inverter type solis_fb00.
+2. Ensure that you have the Solax Modbus integration running and select the inverter type **Solis FB00** (not **Solis**).
    There are a number of entities which this integration disables by default that you will need to enable via the Home Assistant GUI:
 
-   | Name                          | Description     |
-   |:----------------------------- |:--------------- |
-   | `sensor.solisx_rtc`           | Real Time Clock |
-   | `sensor.solisx_battery_power` | Battery Power   |
+   | Name                         | Description     |
+   |:---------------------------- |:--------------- |
+   | `sensor.solis_rtc`           | Real Time Clock |
+   | `sensor.solis_battery_power` | Battery Power   |
 
-3. Copy the template <https://github.com/springfall2008/batpred/blob/main/templates/gilong_solis.yaml> over the top of your `apps.yaml`, and modify it for your system.
-   You will need to update these lines:
+3. Copy the template <https://github.com/springfall2008/batpred/blob/main/templates/ginlong_solis_fb00.yaml> over the top of your `apps.yaml`, and modify it for your system:
 
-- Replace **inverter_type: "GS"** with **inverter_type: "GS_fb00"** to enable the inverter template for the newer firmware version of Solis inverters
+- Set **battery_rate_max**, **soc_max** and **inverter_limit** to match your inverter and battery
 
-- Un-comment **charge_update_button** and **discharge_update_button** and comment out **charge_discharge_update_button** to enable the two "button presses" needed for writing charge/discharge times to the inverter
+- Check that each entity name matches the ones your Solax Modbus integration created, as the prefixes depend on the name you gave the integration
 
-- Un-comment **scheduled_charge_enable** and **scheduled_discharge_enable** to enable Predbat to enable/disable the charge/discharge slots
-
-- Un-comment **charge_limit** to enable the charge limit through setting an upper SoC value
-
-- Set **solax_modbus_new** to True if you have integration version 2024.03.2 or greater
+- **grid_power** uses the Solis meter (`sensor.solis_meter_active_power`), which already reports import as negative so no invert is needed. If your Solis meter is not at the grid connection, point it at another grid sensor instead (see the comments in the template)
 
 - Lastly you will need to comment out or delete the **template** line to enable the configuration
 
 4. Save the file as `apps.yaml` to the appropriate [Predbat software directory](apps-yaml.md#appsyaml-settings).
 
-5. Ensure that the inverter is set to Control Mode 35 - on the Solax integration this is `Timed Charge/Discharge`.
-   If you want to use the `Reserve` functionality within PredBat you will need to select `Backup/Reserve` (code 51) instead but be aware that this is not fully tested.
-   In due course, these mode settings will be incorporated into the code.
+5. Predbat keeps the inverter's Energy Storage Control Switch (**energy_control_switch** in `apps.yaml`) on `Backup/Reserve`: Self-Use with the inverter's Battery Reserve switched on and grid charging allowed.
+   This firmware has no separate `Timed Charge/Discharge` control mode - timed charging and exporting are turned on and off for each slot instead, and Predbat does this using the slot 1 enable switches (**scheduled_charge_enable** and **scheduled_discharge_enable** in `apps.yaml`).
+   The Battery Reserve makes the Reserved SOC (**reserve** in `apps.yaml`, `number.solis_inverter_backup_mode_soc`) a real discharge floor, so Predbat can hold the battery on it - for **freeze charging**, while a car or iBoost charges, and when it holds a charge at its target. Turn on **switch.predbat_set_reserve_enable** for these holds.
+   Grid charging matters too: in any of the `No Grid Charging` modes a charge slot cannot charge from the grid, so Predbat puts the switch back to `Backup/Reserve` if it finds it there (for example after a period controlled by SolisCloud).
+   During a freeze or hold Predbat switches to `Backup/Reserve - No Grid Charging`, so the inverter does not import from the grid to reach the raised reserve, and back to `Backup/Reserve` afterwards.
+   For **freeze exporting** it switches to `Feed-in priority - No Grid Charging`, so solar goes to the house and then the grid rather than into the battery, while the battery still covers the house load down to the inverter's own minimum SoC.
+   If **energy_control_switch** is missing from your `apps.yaml`, Predbat warns during charge slots and you will need to keep the switch on `Backup/Reserve` yourself.
+   If you use the pre-FB00 setup (`inverter_type: "GS"`) on this firmware, charging can appear to work but exports will not, and Predbat will repeatedly report control interference on the Energy Storage Control Switch.
 
-6. Note: Predbat will read the minimum SoC level set on the inverter via **sensor.solis_battery_minimum_soc** configured in `apps.yaml`.
+6. Note: Predbat will read the minimum SoC level set on the inverter via **number.solis_inverter_battery_minimum_soc** configured in `apps.yaml`.
    You must set the minimum SoC level that Predbat will set in **input_number.predbat_set_reserve_min** to at least 1% more than the inverter minimum SoC.<BR>
    So for example, if the inverter minimum SoC is set to 20%, predbat_set_reserve_min must be set to at least 21%. If this is not done then when Predbat sets the reserve SoC, the instruction will be rejected by the inverter and Predbat will error.
 
@@ -2732,12 +2732,14 @@ Nobody on the Predbat project has a Sunsynk account, so this integration's wire 
 You need a Sunsynk Connect account e-mail and password - the same login used by the Sunsynk phone app. Add them to `apps.yaml`:
 
 ```yaml
-  sunsynk_username: 'you@example.com'
-  sunsynk_password: 'your-password'
+  sunsynk_username: !secret sunsynk_username
+  sunsynk_password: !secret sunsynk_password
   sunsynk_region: 'sunsynk'
   sunsynk_automatic: true
   sunsynk_control_enable: true
 ```
+
+Keep your Sunsynk login in `secrets.yaml` rather than in `apps.yaml` - see [Storing secrets](apps-yaml.md#storing-secrets).
 
 Set `sunsynk_region` to `'inteless'` instead of `'sunsynk'` if your account logs in via the `pv.inteless.com` host rather than `api.sunsynk.net` - check with your installer, or try the [diagnostics CLI](#verifying-with-the-sunsynk-diagnostics-cli) below with each region if you are not sure.
 
@@ -2970,12 +2972,17 @@ template:
 The component needs only your token in `apps.yaml` and no Home Assistant Tesla integration (`site_id` is optional - omit it to use the first site on your account):
 
 ```yaml
-  teslemetry_key: 'your-teslemetry-token'
+  teslemetry_key: !secret teslemetry_key
   teslemetry_site_id: 'your-energy-site-id'  # optional: omit to use the first site on your account
   teslemetry_automatic: True
+  #teslemetry_tbc_control: False  # optional: on by default, uncomment to opt out - see below
 ```
 
+Keep the token in `secrets.yaml` rather than in `apps.yaml` - see [Storing secrets](apps-yaml.md#storing-secrets).
+
 Copy the template [teslemetry.yaml](https://raw.githubusercontent.com/springfall2008/batpred/main/templates/teslemetry.yaml) over the top of your `apps.yaml` and edit for your system. See [Tesla Powerwall Teslemetry API](components.md#tesla-powerwall-teslemetry-api-teslemetry) for details.
+
+`teslemetry_tbc_control` is on by default - that is the default *within* this beta component, which as a whole is still covered by the beta warning above; it is not a statement that the control path has graduated. Predbat pushes a control-signal tariff (0p over the charge window, 100p over the export window, 50p import elsewhere) and switches the Powerwall to Time-Based Control, so Tesla's own Opticaster runs the charge at full rate rather than the slower reserve-driven charge. While it is on, Predbat's charge and export target percentages are advisory, because Tesla decides how much energy actually moves. Grid charging under this mode is enabled only inside a charge window that is below target and whose reserve resolves below 100% - it is off outside a charge window entirely (including the demand and export states). One known limitation: the reserve resolves to 100% not only when Predbat is deliberately holding the battery there, but also whenever it asks for anything in the 81-99% band, which Powerwall firmware since 25.18.4 will not hold below 100% - so a `set_reserve_min` anywhere from 81 to 99 (a plausible value in its own right) leaves grid charging disabled in every state, permanently, with only a one-off log line to explain why. This is deliberate: on a Powerwall, grid-charging up to a 100% reserve triggers the slow throttled charge this mode exists to avoid. To opt out, set `teslemetry_tbc_control: False`: Predbat then pushes your real import/export rates and drives the charge through the backup reserve instead - slower, but the charge and export targets are enforced.
 
 ### Manual configuration via Home Assistant integrations
 
@@ -3529,7 +3536,6 @@ The following template can be used as a starting point:
     support_charge_freeze: False
     support_discharge_freeze: False
     has_ge_inverter_mode: False
-    has_fox_inverter_mode: False
     has_idle_time: False
     has_time_window: False
     charge_time_format: "S"
@@ -3793,10 +3799,6 @@ to `false` disables it regardless.
 ### has_ge_inverter_mode
 
 When True, the inverter supports the GivEnergy inverter modes (ECO, Timed Export etc).
-
-### has_fox_inverter_mode
-
-When True, the inverter supports Fox inverter modes, i.e. Eco (Paused) is treated the same as Eco mode and the inverter mode is always set to "SelfUse" as all charging and discharging is controlled by schedule, not inverter modes.
 
 ### has_idle_time
 

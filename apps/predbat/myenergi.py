@@ -761,12 +761,20 @@ MAX_POLL_SECONDS = 30 * 60
 class MyEnergiAPI(ComponentBase, OAuthMixin):
     """myenergi component providing Zappi and Eddi monitoring and boost control."""
 
-    def initialize(self, auth_method=None, hub_serial=None, api_key=None, key=None, token_expires_at=None, token_hash=None, automatic=True, enable_controls=True, poll_seconds=60, zappi_control=False):
+    def initialize(self, auth_method=None, hub_serial=None, api_key=None, key=None, token_expires_at=None, token_hash=None, automatic=True, enable_controls=True, poll_seconds=60, zappi_control=False, automatic_zappi=True, automatic_eddi=True):
         """Select a transport from the configured credentials and set up component state."""
         configured_auth_method = (auth_method or "direct").lower()
         self.hub_serial = hub_serial
         self.api_key = api_key
         self.automatic = automatic
+        # Both halves are kept apart from automatic so either device kind can be left out
+        # on its own: an Eddi owner who charges their car with something else sets
+        # automatic_zappi false, and a Zappi owner whose hot water diverter is handled
+        # elsewhere sets automatic_eddi false. Each defaults on, unlike ge_cloud_automatic_evc,
+        # because myenergi already wires both device kinds under automatic and an upgrade
+        # must not silently take that away from existing users.
+        self.automatic_zappi = automatic_zappi
+        self.automatic_eddi = automatic_eddi
         self.enable_controls = enable_controls
         self.zappi_control = bool(zappi_control)
         # ComponentBase.start() calls run() on a fixed 60 second cadence, so the poll
@@ -838,6 +846,15 @@ class MyEnergiAPI(ComponentBase, OAuthMixin):
 
         The Zappi live power sensors go to car_charging_power, which is display-only: it feeds
         the web power flow diagram and the predbat.car_charging_power sensor, never the plan.
+        The same sensors go to car_charging_now, which counts a car as charging from
+        CAR_CHARGING_NOW_POWER_W, so Octopus Intelligent slot confirmation and the battery hold
+        for the car see a Zappi drawing power - boosting included. Only its live state is read,
+        so a car_charging_now the user set in apps.yaml is kept rather than replaced.
+
+        The two halves are gated separately: a Zappi is an EV charger and an Eddi is a hot
+        water diverter, so automatic_zappi off leaves the Eddi wiring in place while
+        contributing no car inputs, and automatic_eddi off does the reverse, for an account
+        that owns only one of the two things it does.
         """
         zappi_energy_entities = []
         zappi_power_entities = []
@@ -845,11 +862,11 @@ class MyEnergiAPI(ComponentBase, OAuthMixin):
         eddi_entity = None
         for device in sorted(self.devices.values(), key=lambda item: item.serial):
             prefix = self.entity_prefix(device)
-            if device.kind == DEVICE_KIND_ZAPPI:
+            if device.kind == DEVICE_KIND_ZAPPI and self.automatic_zappi:
                 zappi_energy_entities.append("sensor.{}_session_energy".format(prefix))
                 zappi_power_entities.append("sensor.{}_power".format(prefix))
                 zappi_plug_entities.append("sensor.{}_plug_status".format(prefix))
-            elif device.kind == DEVICE_KIND_EDDI and eddi_entity is None:
+            elif device.kind == DEVICE_KIND_EDDI and self.automatic_eddi and eddi_entity is None:
                 eddi_entity = "sensor.{}_session_energy".format(prefix)
 
         if zappi_energy_entities:
@@ -859,6 +876,8 @@ class MyEnergiAPI(ComponentBase, OAuthMixin):
             self.set_arg_auto("car_charging_planned", zappi_plug_entities)
             self.log("Info: myenergi: setting car_charging_power to {}".format(zappi_power_entities))
             self.set_arg_auto("car_charging_power", zappi_power_entities)
+            self.log("Info: myenergi: setting car_charging_now to {}".format(zappi_power_entities))
+            self.set_arg_auto("car_charging_now", zappi_power_entities, overwrite=False)
         if eddi_entity:
             self.log("Info: myenergi: setting iboost_energy_today to {}".format(eddi_entity))
             self.set_arg_auto("iboost_energy_today", eddi_entity)
@@ -903,6 +922,9 @@ class MyEnergiAPI(ComponentBase, OAuthMixin):
             return
         if not self.automatic:
             self.log("Warn: myenergi: myenergi_zappi_control needs myenergi_automatic to map each Zappi to a car, Zappi control is disabled")
+            return
+        if not self.automatic_zappi:
+            self.log("Warn: myenergi: myenergi_zappi_control needs myenergi_automatic_zappi to map each Zappi to a car, Zappi control is disabled")
             return
         if not self.enable_controls:
             self.log("Warn: myenergi: myenergi_zappi_control is ignored while myenergi_enable_controls is off")
@@ -1254,7 +1276,7 @@ async def run_myenergi_cli(args):  # pragma: no cover
         "key": args.token,
         "token_hash": args.token_hash,
         # On by default, as it is in apps.yaml, so a harness run shows the car_charging_energy,
-        # car_charging_planned and iboost_energy_today wiring a real run would set up - that
+        # car_charging_planned, car_charging_now and iboost_energy_today wiring a real run would set up - that
         # mapping is most of what there is to check before trusting the component with a car.
         "automatic": not args.no_automatic,
         "enable_controls": True,
@@ -1338,7 +1360,7 @@ def main():  # pragma: no cover
     charge_group.add_argument("--start-charge", action="store_true", help="Put the first Zappi in {} to charge now, as a planned window does".format(ZAPPI_MODE_CHARGING))
     charge_group.add_argument("--stop-charge", action="store_true", help="Put the first Zappi in {}, as being outside a planned window does".format(ZAPPI_MODE_STOPPED))
     charge_group.add_argument("--release", action="store_true", help="Put the first Zappi back in {}, as releasing it does".format(ZAPPI_MODE_RELEASE))
-    parser.add_argument("--no-automatic", action="store_true", help="Skip the automatic configuration of car_charging_energy, car_charging_planned and iboost_energy_today")
+    parser.add_argument("--no-automatic", action="store_true", help="Skip the automatic configuration of car_charging_energy, car_charging_planned, car_charging_now and iboost_energy_today")
     parser.add_argument("--raw", action="store_true", help="Print the full normalised device records")
 
     args = parser.parse_args()

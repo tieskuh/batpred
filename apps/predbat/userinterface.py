@@ -19,7 +19,10 @@ service calls) to the appropriate handlers.
 
 import os
 from datetime import timedelta
-from utils import get_override_time_from_string, mask_secret_args, is_debug_excluded_key
+from utils import get_override_time_from_string, mask_secret_args, is_debug_excluded_key, export_limits_from_stored, export_limits_to_stored, is_secret_key, SECRET_MASK
+import functools
+import io
+import itertools
 import json
 import yaml
 import re
@@ -28,11 +31,64 @@ from const import (
     TIME_FORMAT,
     PREDBAT_MODE_OPTIONS,
     PREDBAT_MODE_MONITOR,
+    DEBUG_SCHEMA_VERSION,
     MANUAL_RATE_MAX_MINUTES,
     MANUAL_TIME_MAX_MINUTES,
 )
 from config import APPS_SCHEMA, CONFIG_API_OVERRIDE
 from predbat import THIS_VERSION, THIS_VERSION_DISPLAY
+
+# A debug dump is several megabytes of deeply nested YAML and PyYAML's pure-Python parser spends
+# most of a replay's wall-clock on it - about 6s for a 5MB dump. CLoader pairs libyaml's C parser
+# with the very same (unsafe) Constructor that yaml.unsafe_load uses, so the Python-object tags
+# these dumps carry still load and the result is identical, roughly 6x faster. PyYAML is not
+# always built with libyaml, so fall back to the pure-Python loader when the C one is absent.
+DEBUG_YAML_LOADER = getattr(yaml, "CLoader", yaml.UnsafeLoader)
+
+
+class DebugYamlDumper(yaml.Dumper):
+    """
+    yaml.Dumper whose anchor ids are drawn from a counter shared by every dumper writing the same stream.
+
+    dump_debug_yaml() emits the debug dict with one yaml.dump() call per top-level key, and each call
+    gets a fresh Dumper whose anchor numbering restarts at id001. Two keys that each contain an internal
+    alias would then both be labelled &id001, and the file would no longer load as a single document
+    ("found duplicate anchor"). Sharing the counter keeps every anchor in the stream unique.
+    """
+
+    def __init__(self, stream, anchor_ids=None, **kwargs):
+        """anchor_ids is the shared itertools.count(); without one this is a plain yaml.Dumper"""
+        super().__init__(stream, **kwargs)
+        self.anchor_ids = anchor_ids
+
+    def generate_anchor(self, node):
+        """Name the next anchor from the shared counter rather than this dumper's own"""
+        if self.anchor_ids is None:
+            return super().generate_anchor(node)
+        return "id{:03d}".format(next(self.anchor_ids))
+
+
+# An export limit is a (mode, target, power) tuple, and PyYAML tags a tuple as !!python/tuple,
+# which yaml.safe_load refuses - the debug dump is an artefact people attach to bug reports and has
+# to load with plain YAML tooling. Written as an ordinary sequence instead. Nothing else in a dump
+# is a tuple today, and a sequence is what a reader wants from one anyway.
+DebugYamlDumper.add_representer(tuple, lambda dumper, value: dumper.represent_list(list(value)))
+
+
+def dump_debug_yaml(debug, stream):
+    """
+    Write the debug dict to stream as one YAML document, one top-level key at a time.
+
+    yaml.dump() builds a Node object for every scalar in the data before it emits a byte, so dumping
+    the whole dict at once costs around thirty times the size of the output - ~150MB for a typical
+    5MB debug file, which set Predbat's peak memory and left ~30MB of heap fragmentation behind
+    at idle. Dumping per key bounds the node tree by the largest key instead (~20MB here). The
+    output is the same sorted single document; the only difference is that an object shared between
+    two top-level keys is written out twice rather than aliased.
+    """
+    dumper = functools.partial(DebugYamlDumper, anchor_ids=itertools.count(1))
+    for key in sorted(debug):
+        yaml.dump({key: debug[key]}, stream, Dumper=dumper)
 
 
 class UserInterface:
@@ -157,6 +213,11 @@ class UserInterface:
                 self.args[arg][index] = value
             else:
                 self.args[arg] = value
+        # A credential value or the redact_strings/redact_strings_labelled denylists themselves
+        # can change here, so log()'s cached redaction pattern (log_secrets.py) must be rebuilt on next
+        # use - otherwise a newly added/changed secret keeps leaking into the log under the stale
+        # pattern until Predbat restarts (GH#4770 review).
+        self._invalidate_log_secret_pattern()
 
     def get_arg(self, arg, default=None, indirect=True, combine=False, attribute=None, index=None, domain=None, can_override=True, required_unit=None):
         """
@@ -634,7 +695,7 @@ class UserInterface:
                     self.log("Restore setting: {} = {} (was {})".format(item["name"], item["default"], item["value"]))
                     await self.async_expose_config(item["name"], item["default"], event=True)
             if self.get_arg("set_system_notify"):
-                await self.async_call_notify("Predbat settings restored from default")
+                await self.async_call_notify(f"{self.prefix.capitalize()} settings restored from default")
         else:
             filepath = os.path.join(self.save_restore_dir, filename)
             if os.path.exists(filepath):
@@ -649,7 +710,7 @@ class UserInterface:
                             self.log("Restore setting: {} = {} (was {})".format(item["name"], item["value"], current["value"]))
                             await self.async_expose_config(item["name"], item["value"], event=True)
                 if self.get_arg("set_system_notify"):
-                    await self.async_call_notify("Predbat settings restored from {}".format(filename))
+                    await self.async_call_notify(f"{self.prefix.capitalize()} settings restored from {filename}")
         await self.async_expose_config("saverestore", None)
 
     def load_current_config(self):
@@ -721,7 +782,7 @@ class UserInterface:
             yaml.dump(self.CONFIG_ITEMS, file)
         self.log("Saved Predbat settings to {}".format(filepath_p))
         if self.get_arg("set_system_notify"):
-            await self.async_call_notify("Predbat settings saved to {}".format(filename))
+            await self.async_call_notify(f"{self.prefix.capitalize()} settings saved to {filename}")
 
     def read_debug_yaml(self, filename):
         """
@@ -730,12 +791,18 @@ class UserInterface:
         debug = {}
         if os.path.exists(filename):
             with open(filename, "r") as file:
-                debug = yaml.unsafe_load(file)
+                debug = yaml.load(file, Loader=DEBUG_YAML_LOADER)
         else:
             self.log("Warn: Debug file {} not found".format(filename))
             return
 
+        schema_version = debug.get("debug_schema_version", 0)
+        if schema_version > DEBUG_SCHEMA_VERSION:
+            self.log("Warn: Debug file {} was written by a newer Predbat (schema {} > {}) - replaying it may misread fields that have changed shape".format(filename, schema_version, DEBUG_SCHEMA_VERSION))
+
         for key in debug:
+            if key == "debug_schema_version":
+                continue
             if key not in ["CONFIG_ITEMS", "inverters"]:
                 self.__dict__[key] = copy.deepcopy(debug[key])
             if key == "inverters":
@@ -744,12 +811,28 @@ class UserInterface:
                     inverter_obj = copy.deepcopy(self.inverters[0])
                     for key in inverter:
                         inverter_obj.__dict__[key] = copy.deepcopy(inverter[key])
+                    # Decoded the same way as the two Predbat-level lists below - the inverter's own
+                    # copy is the same encoding and arrives in the same three shapes
+                    if hasattr(inverter_obj, "export_limits"):
+                        inverter_obj.export_limits = export_limits_from_stored(inverter_obj.export_limits)
                     new_inverters.append(inverter_obj)
                 self.inverters = new_inverters
 
         # Handle old-format octopus_slots (flat list of dicts) vs new format (list-of-lists per car)
         if isinstance(self.octopus_slots, list) and self.octopus_slots and isinstance(self.octopus_slots[0], dict):
             self.octopus_slots = [self.octopus_slots] + [[] for _ in range(7)]
+
+        # Both export limit lists come back from the dump as self-describing mappings (or bare
+        # packed floats in an older dump, or 3-element sequences a YAML round trip made of the
+        # tuples) - decode each back to a (mode, target, power) tuple. export_limits is the current
+        # inverter state; export_limits_best is the plan.
+        for attr in ("export_limits", "export_limits_best"):
+            if hasattr(self, attr):
+                setattr(self, attr, export_limits_from_stored(getattr(self, attr)))
+        if hasattr(self, "plan_preclip") and isinstance(self.plan_preclip, (list, tuple)) and len(self.plan_preclip) > 3:
+            self.plan_preclip = list(self.plan_preclip)
+            self.plan_preclip[3] = export_limits_from_stored(self.plan_preclip[3])
+            self.plan_preclip = tuple(self.plan_preclip)
 
         for item in debug["CONFIG_ITEMS"]:
             current = self.config_index.get(item["name"], None)
@@ -789,19 +872,60 @@ class UserInterface:
                 if not key.startswith("__") and not callable(getattr(inverter, key)):
                     if key.startswith("base"):
                         pass
+                    elif getattr(inverter.__dict__[key], "base", None) is not None:
+                        # A helper object that keeps its own back-reference to Predbat (the GivTCP
+                        # REST client, Inverter.givtcp). yaml.dump() walks arbitrary objects through
+                        # __reduce_ex__(), so emitting one serialises the entire PredBat graph
+                        # through its .base: the dump either dies on the first unpicklable thing it
+                        # meets - an in-flight coroutine, the open log file - or, worse, succeeds and
+                        # writes ha_interface's access token and every other member
+                        # is_debug_excluded_key() deliberately drops into the file users attach to
+                        # public bug reports. Skipping "base" alone was enough only while every
+                        # such reference was named that.
+                        pass
                     else:
                         inverter_debug[key] = inverter.__dict__[key]
+            # Each inverter keeps its own copy of the current export instructions, in the same
+            # encoding as the two lists below - so it is written the same self-describing way rather
+            # than as the bare sequence the tuple representer would otherwise emit, which a replay
+            # would restore as a list and hand to export_mode_of to compare against a float.
+            if "export_limits" in inverter_debug:
+                inverter_debug["export_limits"] = export_limits_to_stored(inverter_debug["export_limits"])
             inverters_debug.append(inverter_debug)
         debug["inverters"] = inverters_debug
         debug["CONFIG_ITEMS"] = copy.deepcopy(self.CONFIG_ITEMS)
+        # Write both export limit lists as self-describing mappings rather than the (mode, target,
+        # power) tuples in memory: 99.0 does not say "freeze" to anything that has not read const.py,
+        # and a tuple would emit as an ordinary sequence a reader could not tell from a window count.
+        for attr in ("export_limits", "export_limits_best"):
+            if attr in debug:
+                debug[attr] = export_limits_to_stored(debug[attr])
+        # Marks how the fields above are shaped, so a replay can tell an old encoding from a new one
+        # rather than guessing from the data. Absent in dumps written before versioning.
+        debug["debug_schema_version"] = DEBUG_SCHEMA_VERSION
+
+        # Explicit: "components" is in DEBUG_EXCLUDE_LIST so nothing under it is dumped
+        # automatically, and a plain redacted dict avoids the object-graph walk described above.
+        # getattr, not a bare attribute access: several tests stand self.components in for a
+        # minimal registry double that does not model .coordinator at all, and this function is
+        # what a real user's bug-report download runs - it must degrade to no discovery section
+        # rather than raise on an attribute a stand-in never promised to have.
+        coordinator = getattr(self.components, "coordinator", None) if self.components else None
+        if coordinator:
+            try:
+                debug["discovery"] = coordinator.catalogue()
+            except Exception as e:
+                self.log("Warn: Failed to add the discovery catalogue to the debug dump: {}".format(e))
 
         if write_file:
             with open(filename, "w") as file:
-                yaml.dump(debug, file)
+                dump_debug_yaml(debug, file)
             self.log("Wrote debug yaml to {}".format(filename_p))
         else:
             # Return the debug yaml as a string
-            return yaml.dump(debug)
+            text = io.StringIO()
+            dump_debug_yaml(debug, text)
+            return text.getvalue()
 
     def create_entity_list(self):
         """
@@ -1127,19 +1251,20 @@ class UserInterface:
         elif isinstance(arg_value, str) and arg_value.startswith("re:"):
             matched = False
             my_re = "^" + arg_value[3:] + "$"
+            secret_arg = is_secret_key(arg)
             for key in state_keys:
                 res = re.search(my_re, key)
                 if res:
                     if len(res.groups()) > 0:
-                        self.log("Regular expression argument {} matched {} with {}".format(arg, my_re, res.group(1)))
                         arg_value = res.group(1)
-                        matched = True
-                        break
                     else:
-                        self.log("Regular expression argument {} Matched {} with {}".format(arg, my_re, res.group(0)))
                         arg_value = res.group(0)
-                        matched = True
-                        break
+                    # A matched entity id can itself embed a credential (e.g. an MPAN), and this fires
+                    # before auto_config()'s caller has invalidated the log-redaction cache to cover the
+                    # new value, so a secret-flagged arg only logs the pattern and key name (#5106).
+                    self.log("Regular expression argument {} matched {} with {}".format(arg, my_re, SECRET_MASK if secret_arg else arg_value))
+                    matched = True
+                    break
         return matched, arg_value
 
     def auto_config(self, final=False):
@@ -1154,6 +1279,7 @@ class UserInterface:
         self.unmatched_args = {}
 
         # Find each arg re to match
+        changed = False
         for arg in self.args:
             arg_value = self.args[arg]
             matched, arg_value = self.resolve_arg_re(arg, arg_value, state_keys)
@@ -1163,11 +1289,25 @@ class UserInterface:
                     disabled.append(arg)
             else:
                 self.args[arg] = arg_value
+                changed = True
 
         # Remove unmatched keys
         for key in disabled:
             self.unmatched_args[key] = self.args[key]
             del self.args[key]
+            changed = True
+
+        # A `re:` pattern can resolve to a live HA entity's state/attribute - a credential-shaped
+        # value from a third-party integration is exactly what redact_strings/redact_strings_labelled
+        # exist to catch (GH#4770) - and a disabled key's removal changes what collect_log_secret_values()
+        # sees from args too. Unlike set_arg() (this class's only other args mutator, which invalidates
+        # unconditionally on every call), auto_config() runs over every configured arg on each call, so
+        # invalidating once at the end - only when something actually changed - avoids rebuilding the
+        # pattern key-by-key while still closing the gap: a value resolved or removed here must not keep
+        # leaking under the stale pattern (or keep being redacted after a redact_strings entry is removed)
+        # until Predbat next restarts.
+        if changed:
+            self._invalidate_log_secret_pattern()
 
     def split_command_index(self, command):
         """
@@ -1317,6 +1457,9 @@ class UserInterface:
             elif "_load" in item["name"]:
                 # Manual load rate
                 self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_load_value"))
+            elif "_soc_max" in item["name"]:
+                # Manual soc maximum (ceiling) rate
+                self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_soc_max_value"))
             elif "_soc" in item["name"]:
                 # Manual soc rate
                 self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_soc_value"))
@@ -1411,15 +1554,14 @@ class UserInterface:
         if values:
             values = "+" + values
 
-        # Create the new dropdown
-        time_values = []
+        # Create the new dropdown, off first so cancelling everything doesn't mean scrolling the whole list (#5105)
+        time_values = ["off"]
         for minute_str in time_overrides:
             minute_str = "[" + minute_str + "]"
             time_values.append(minute_str)
 
         if values not in time_values:
             time_values.append(values)
-        time_values.append("off")
         item["options"] = time_values
         if not values:
             values = "off"
@@ -1440,13 +1582,15 @@ class UserInterface:
         minutes_now = int((self.now_utc - midnight_utc).total_seconds() / 60)
         return midnight_utc, minutes_now
 
-    def manual_rates(self, config_item, exclude=[], new_value=None, default_rate=0, update=True):
+    def manual_rates(self, config_item, exclude=None, new_value=None, default_rate=0, update=True):
         """
         Update manual rates sensor
 
         Set update=False to decode the stored selection without writing it back - read-only
         callers should use this. See the note in manual_times() for the shared time origin.
         """
+        if exclude is None:
+            exclude = []
         rate_overrides_minutes = {}
         rate_overrides = []
         plan_interval = self.get_arg("plan_interval_minutes", 30)
@@ -1505,9 +1649,9 @@ class UserInterface:
         if values:
             values = "+" + values
 
-        # Create the new dropdown
+        # Create the new dropdown, off first so cancelling everything doesn't mean scrolling the whole list (#5105)
         if update:
-            time_values = []
+            time_values = ["off"]
             for minute in range(minutes_now, minutes_now + manual_rate_max, plan_interval):
                 minute_str = (midnight_utc + timedelta(minutes=minute)).strftime("%a %H:%M")
                 if minute in rate_overrides_minutes:
@@ -1518,7 +1662,6 @@ class UserInterface:
 
             if values not in time_values:
                 time_values.append(values)
-            time_values.append("off")
             item["options"] = time_values
             if not values:
                 values = "off"
@@ -1526,7 +1669,7 @@ class UserInterface:
 
         return rate_overrides_minutes
 
-    def manual_times(self, config_item, exclude=[], new_value=None, update=True):
+    def manual_times(self, config_item, exclude=None, new_value=None, update=True):
         """
         Update manual times sensor
 
@@ -1539,6 +1682,8 @@ class UserInterface:
         Set update=False to decode the stored selection without writing it back, which is what a
         read-only caller wants.
         """
+        if exclude is None:
+            exclude = []
         time_overrides = []
         plan_interval = self.get_arg("plan_interval_minutes", 30)
         midnight_utc, minutes_now_real = self.manual_time_origin()
@@ -1583,9 +1728,9 @@ class UserInterface:
         if values:
             values = "+" + values
 
-        # Create the new dropdown
+        # Create the new dropdown, off first so cancelling everything doesn't mean scrolling the whole list (#5105)
         if update:
-            time_values = []
+            time_values = ["off"]
             for minute in range(minutes_now, minutes_now + manual_time_max, plan_interval):
                 minute_str = (midnight_utc + timedelta(minutes=minute)).strftime("%a %H:%M")
                 if minute in time_overrides:
@@ -1594,7 +1739,6 @@ class UserInterface:
 
             if values not in time_values:
                 time_values.append(values)
-            time_values.append("off")
             item["options"] = time_values
             if not values:
                 values = "off"

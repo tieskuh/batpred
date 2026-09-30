@@ -1,5 +1,7 @@
 # Custom Dictionary Words
+3hy
 aaaabbbbccccdddd
+acks
 activepower
 adata
 adbase
@@ -14,6 +16,7 @@ aios
 Alertfeed
 allclose
 alphaess
+am2
 annualform
 Anson
 antiphase
@@ -56,6 +59,7 @@ batteryb
 batusecap
 beforeunload
 bierner
+bisectable
 Bitwarden
 BLAS
 boostable
@@ -64,6 +68,7 @@ brickatius
 bwignore
 byok
 cadata
+calcsize
 calib
 Cantarell
 cbat
@@ -72,6 +77,7 @@ cdn
 Cerbo
 cexxxx
 ceyyyy
+CGNAT
 Chae
 Chaf
 chargedischarge
@@ -119,6 +125,7 @@ Dashlane
 datain
 datalist
 datalog
+datalogger
 datap
 datapoints
 datas
@@ -127,12 +134,15 @@ dateutil
 dayname
 daynumber
 daysymbol
+deadband
+deadbanding
 deadbeefdeadbeef
 dedup
 dedupe
 dend
 denorm
 derate
+derated
 derating
 desync
 desynced
@@ -150,15 +160,18 @@ Dise
 Disf
 diverter
 dlimit
+dlopen
 dnoregion
 docstrings
 dstamp
 dstart
+dtype
 dwindow
 eauth
 echargingpile
 Eddi
 eddis
+efgh
 elif
 elinter
 eload
@@ -193,6 +206,7 @@ etoday
 etok
 euids
 evcc
+EVAC
 EVDC
 evergen
 evilspringfall
@@ -221,6 +235,7 @@ foxcloud
 foxess
 foxesscloud
 freephase
+fromisoformat
 fronius
 funcs
 futurerate
@@ -234,19 +249,24 @@ geserial
 geseriale
 getaffinity
 getall
+getattr
 getrusage
 Ginlong
 gitnexus
+giv
 GivEnergy
 givtcp
+gmtime
 gnueabihf
 GOELEC
+goldens
 gridcharge
 gridcode
 gridconsumption
 gridconsumptionpower
 Groq
 growatt
+growattsph
 GWMQTT
 HACS
 hadashboard
@@ -272,6 +292,7 @@ holdout
 homeassistant
 houseb
 htmlcov
+hultenvp
 husforbrukning
 hypervolt
 iboost
@@ -305,9 +326,11 @@ jstatus
 jsyaml
 kaiming
 keepalive
+kellerza
 keydb
 khtml
 killall
+Kiritimati
 kopt
 Kostal
 kostalplenticore
@@ -316,6 +339,7 @@ Krakenflex
 Kuzu
 kvar
 kvarh
+kwarg
 kwargs
 kwhb
 labelcolor
@@ -325,6 +349,7 @@ ladybugdb
 larr
 libbi
 libc
+libyaml
 LIFEPO
 linebreak
 linestyle
@@ -341,6 +366,8 @@ lookback
 lpignore
 lstrip
 luxpower
+malloc
+mallopt
 markdownlint
 matplotlib
 maximise
@@ -388,6 +415,7 @@ mpxn
 mqtt
 mtok
 mult
+multiarray
 myaccount
 myenergi
 mypy
@@ -403,6 +431,7 @@ newtok
 njpwerner
 nobat
 nocharge
+NODETAIL
 nodischarge
 nohup
 noopener
@@ -428,6 +457,7 @@ ollama
 onblur
 onchange
 oncharge
+oneline
 onfocus
 oninput
 onmouseout
@@ -435,6 +465,7 @@ onmouseover
 openapi
 openrouter
 openweathermap
+Opticaster
 overclaim
 overfitting
 oversizing
@@ -470,18 +501,24 @@ preclip
 pred
 predai
 predbat
+predbatsolcast
 predbatt
 predheat
 preseed
 preseeded
 prevs
 protobuf
+pseudonymisation
+pseudonymise
+pseudonymised
+pseudonymises
 psum
 pthread
 pvbat
 pvenergytotal
 pvlib
 pvlimit
+PVONLY
 pvpower
 pvwatts
 pwindow
@@ -495,6 +532,7 @@ pythonhashseed
 pytz
 Qwen
 randn
+rany2
 rarr
 reactivepower
 readback
@@ -543,7 +581,10 @@ Sergoe
 sess
 setattr
 setdefault
+setpoints
+setstate
 SFMB
+sg05lp1
 SIGALRM
 sigcloud
 sigen
@@ -560,6 +601,7 @@ snakeviz
 snprintf
 socb
 socketloop
+socmax
 socs
 sofar
 SolarEdge
@@ -646,6 +688,7 @@ typecodes
 tzfile
 tzpath
 unasserted
+uncalibrated
 uncompilable
 unconfigured
 underivable
@@ -663,6 +706,7 @@ unpushed
 unreachability
 unredacted
 unregisters
+unrepresentable
 unreproduced
 unsmoothed
 unstaged
@@ -677,9 +721,11 @@ varh
 venv
 Victron
 visibilitychange
+vvwwxxabcdefyyzzuu
 waf
 waitpid
 Wallbox
+weakref
 weblink
 welink
 Werror
@@ -687,8 +733,10 @@ WEXITSTATUS
 WIFEXITED
 WNOHANG
 workmode
+worktree
 writeonly
 wrongsha
+wwxxabcdefyyzz
 xaxis
 xaxistooltip
 xlabel
@@ -696,6 +744,7 @@ xlim
 xload
 xrtkq
 xticks
+xxabcdefyy
 yaxis
 yaxistooltip
 yday
