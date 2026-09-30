@@ -336,8 +336,14 @@ class Plan:
         the charge going on its own. The live plan's prediction and export windows read it through
         car_charging_slots_model(), so the battery is held for the car there as execute_plan() holds it.
         """
+        car_charging_solar = getattr(self, "car_charging_solar", [])
         for car_n in range(self.num_cars):
             if not self.car_charging_now_active(car_n) or car_n >= len(self.car_charging_rate):
+                continue
+            if car_n < len(car_charging_solar) and car_charging_solar[car_n] and not (car_n < len(self.car_charging_planned) and self.car_charging_planned[car_n]):
+                # Opportunistic solar charging with no plan: the prediction's solar diversion already models the
+                # PV surplus this car draws, so a slot at its full charging rate would count that energy twice.
+                self.log("Car {} is charging now on opportunistic solar with no plan, modelled by the solar diversion rather than at its full rate".format(car_n))
                 continue
             covered = any(slot["start"] <= self.minutes_now < slot["end"] and slot.get("kwh", 0) > 0 for slot in (self.car_charging_slots[car_n] if car_n < len(self.car_charging_slots) else []))
             if covered or minutes_end_slot <= self.minutes_now:
